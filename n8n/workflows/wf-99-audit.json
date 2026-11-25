@@ -1,0 +1,120 @@
+{
+  "id": "kcwf99audit00001",
+  "name": "WF-99 audit (감사 로그)",
+  "active": true,
+  "nodes": [
+    {
+      "id": "c95c94b2-ff33-5115-a9cd-db495e14877a",
+      "name": "다른 흐름에서 호출",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        100
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "944cb904-f42e-5072-ab14-93d7fd4101b9",
+      "name": "흐름 실패",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "3758929c-dcc2-5296-b03e-1f5a010f8c11",
+      "name": "오류 정리",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// 다른 워크플로가 실패하면 여기로 온다 (워크플로 설정의 Error Workflow)\nconst e = $json;\nreturn [{ json: { flow: e.workflow?.name ?? 'unknown', result: 'error', execution_id: e.execution?.id ?? null,\n  failed_node: e.execution?.lastNodeExecuted ?? null, error: (e.execution?.error?.message ?? '').slice(0, 500) } }];"
+      }
+    },
+    {
+      "id": "8149d021-9777-5fd2-be62-ef61388ac78e",
+      "name": "감사 로그 보내기",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://chat-gateway.aiops.svc:8080/audit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ...$json, at: new Date().toISOString() }) }}",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kcgatewayapi0001",
+          "name": "chat-gateway API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "다른 흐름에서 호출": {
+      "main": [
+        [
+          {
+            "node": "감사 로그 보내기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "흐름 실패": {
+      "main": [
+        [
+          {
+            "node": "오류 정리",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "오류 정리": {
+      "main": [
+        [
+          {
+            "node": "감사 로그 보내기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "pinData": {},
+  "tags": []
+}
