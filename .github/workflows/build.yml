@@ -1,5 +1,6 @@
 # 바뀐 서비스만 이미지로 빌드 → ghcr.io 푸시 → cosign 서명(keyless) → kube-chatops-deploy 에 digest bump.
 # 서비스 = Dockerfile 이 있는 services/*, demo/* 폴더. 이미지 이름 = 폴더 이름.
+# services/mcp-common 은 이미지가 아니라 MCP 서버들이 함께 쓰는 패키지 (Dockerfile 없음).
 name: build
 on:
   push:
@@ -44,6 +45,10 @@ jobs:
             dirs="$all"
           else
             changed=$(git diff --name-only "$BEFORE" HEAD)
+            # 공통 패키지가 바뀌면 그것을 쓰는 MCP 서버를 모두 다시 빌드
+            if grep -q '^services/mcp-common/' <<<"$changed"; then
+              changed="$changed"$'\n'"$(for d in $all; do case $d in services/mcp-*) echo "$d/";; esac; done)"
+            fi
             dirs=$(for d in $all; do if grep -q "^$d/" <<<"$changed"; then echo "$d"; fi; done)
           fi
           matrix=$(for d in $dirs; do jq -cn --arg p "$d" '{path:$p, name:($p|split("/")[-1])}'; done | jq -cs '{include: .}')
@@ -74,6 +79,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.path }}
+          # MCP 서버 Dockerfile 이 COPY --from=mcp-common 으로 공통 패키지를 가져간다 (다른 서비스는 쓰지 않음)
+          build-contexts: mcp-common=services/mcp-common
           push: true
           tags: ${{ env.REGISTRY }}/${{ matrix.name }}:${{ github.sha }}
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
