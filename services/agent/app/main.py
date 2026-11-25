@@ -36,8 +36,8 @@ from .toolbox import Toolbox  # noqa: E402
 logging.basicConfig(level=logging.INFO, format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}')
 log = logging.getLogger("agent")
 
-REQUESTS = Counter("agent_requests_total", "API 요청 수", ["endpoint", "status"])
-DURATION = Histogram("agent_request_duration_seconds", "API 처리 시간", ["endpoint"], buckets=(1, 2.5, 5, 10, 20, 40, 60, 120, 180, 300))
+REQUESTS = Counter("agent_requests_total", "API 요청 수", ["api", "status"])
+DURATION = Histogram("agent_request_duration_seconds", "API 처리 시간", ["api"], buckets=(1, 2.5, 5, 10, 20, 40, 60, 120, 180, 300))
 STOPS = Counter("agent_investigation_stops_total", "조사 종료 이유", ["reason"])
 
 

@@ -2,7 +2,7 @@
 
 - 응답마다 usage(입력, 출력, 캐시 쓰기, 캐시 읽기 토큰)로 비용을 계산해 Postgres `agent_spend` 에 날짜별로 더한다.
 - 하루 누적이 DAILY_BUDGET_USD 를 넘으면 새 요청을 거절한다 (요청 하나는 MAX_REQUEST_USD 로 따로 묶여 있어 초과 폭이 제한된다).
-- 같은 값을 Prometheus 메트릭으로도 노출한다.
+- 같은 값을 Prometheus 메트릭으로도 노출한다. 라벨 이름에 endpoint 는 쓰지 않는다 (ServiceMonitor 가 붙이는 endpoint 라벨과 겹쳐 덮어써진다).
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ PRICES = {
 FALLBACK_PRICE = (10.0, 50.0)
 
 TOKENS = Counter("agent_llm_tokens_total", "LLM 토큰 수", ["model", "kind"])
-COST = Counter("agent_llm_cost_usd_total", "LLM 비용 (USD, 추정)", ["model", "endpoint"])
+COST = Counter("agent_llm_cost_usd_total", "LLM 비용 (USD, 추정). stage: route, investigate, report", ["model", "stage"])
 SPENT_TODAY = Gauge("agent_budget_spent_today_usd", "오늘 누적 비용 (USD)")
 BUDGET_LIMIT = Gauge("agent_budget_daily_limit_usd", "하루 예산 (USD)")
 BUDGET_LIMIT.set(settings.daily_budget_usd)
