@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from prometheus_client import Counter, Gauge
@@ -14,16 +15,19 @@ from psycopg_pool import AsyncConnectionPool
 
 from .config import settings
 
-# 1M 토큰당 USD (입력, 출력). 캐시 쓰기는 입력의 1.25배, 캐시 읽기는 0.1배.
+log = logging.getLogger("agent.cost")
+
+# 1M 토큰당 USD (입력, 출력, 캐시 읽기 배수). 캐시 쓰기(5분 TTL)는 입력의 1.25배.
+# 캐시 읽기 배수는 모델마다 다르다 (Opus 5.5, Sonnet 5.5 는 0.05배). 확인하지 못한 값은 0.1배로 보수적으로 잡는다.
 # 표에 없는 모델은 가장 비싼 값으로 계산해 예산을 보수적으로 잡는다.
 PRICES = {
-    "claude-opus-5-5": (4.0, 20.0),
-    "claude-sonnet-5-5": (2.0, 10.0),
-    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-opus-5-5": (4.0, 20.0, 0.05),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.05),
+    "claude-haiku-5-5": (0.10, 0.50, 0.1),
 }
-FALLBACK_PRICE = (10.0, 50.0)
+FALLBACK_PRICE = (10.0, 50.0, 0.1)
 
-TOKENS = Counter("agent_llm_tokens_total", "LLM 토큰 수", ["model", "kind"])
+TOKENS = Counter("agent_llm_tokens_total", "LLM 토큰 수. kind: input(캐시 안 됨), cache_write, cache_read, output", ["model", "stage", "kind"])
 COST = Counter("agent_llm_cost_usd_total", "LLM 비용 (USD, 추정). stage: route, investigate, report, answer", ["model", "stage"])
 SPENT_TODAY = Gauge("agent_budget_spent_today_usd", "오늘 누적 비용 (USD)")
 BUDGET_LIMIT = Gauge("agent_budget_daily_limit_usd", "하루 예산 (USD)")
@@ -52,15 +56,18 @@ class Usage:
     by_model: dict[str, float] = field(default_factory=dict)
 
 
-def cost_of(model: str, usage) -> tuple[float, int, int]:
-    p_in, p_out = PRICES.get(model, FALLBACK_PRICE)
+def cost_of(model: str, stage: str, usage) -> tuple[float, int, int]:
+    p_in, p_out, read_mult = PRICES.get(model, FALLBACK_PRICE)
     cache_write = usage.cache_creation_input_tokens or 0
     cache_read = usage.cache_read_input_tokens or 0
     fresh = usage.input_tokens or 0
     out = usage.output_tokens or 0
-    cost = (fresh * p_in + cache_write * p_in * 1.25 + cache_read * p_in * 0.1 + out * p_out) / 1_000_000
+    cost = (fresh * p_in + cache_write * p_in * 1.25 + cache_read * p_in * read_mult + out * p_out) / 1_000_000
     for kind, n in (("input", fresh), ("cache_write", cache_write), ("cache_read", cache_read), ("output", out)):
-        TOKENS.labels(model, kind).inc(n)
+        TOKENS.labels(model, stage, kind).inc(n)
+    # 호출 하나마다 한 줄. 캐시가 어느 단계에서 깨지는지 Loki 에서 바로 본다.
+    log.info("llm_call stage=%s model=%s input=%d cache_write=%d cache_read=%d output=%d cost_usd=%.5f",
+             stage, model, fresh, cache_write, cache_read, out, cost)
     return cost, fresh + cache_write + cache_read, out
 
 
@@ -81,7 +88,7 @@ class Ledger:
         return spent
 
     async def record(self, model: str, endpoint: str, response_usage, acc: Usage) -> float:
-        cost, tin, tout = cost_of(model, response_usage)
+        cost, tin, tout = cost_of(model, endpoint, response_usage)
         acc.cost_usd += cost
         acc.input_tokens += tin
         acc.output_tokens += tout
@@ -108,5 +115,5 @@ class Ledger:
 for _model in PRICES:
     for _stage in ("route", "investigate", "report", "answer"):
         COST.labels(_model, _stage)
-    for _kind in ("input", "cache_write", "cache_read", "output"):
-        TOKENS.labels(_model, _kind)
+        for _kind in ("input", "cache_write", "cache_read", "output"):
+            TOKENS.labels(_model, _stage, _kind)
