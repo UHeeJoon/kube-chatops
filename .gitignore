@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Rust
+target/
+
+# ML
+mlruns/
+*.parquet
+*.onnx
+
+# 기타
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/
