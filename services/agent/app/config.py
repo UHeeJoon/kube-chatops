@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     model: str = "claude-opus-5-5"
     route_model: str = "claude-opus-5-5"
     investigate_effort: str = "medium"
+    # 보고서는 이미 모은 근거를 정리만 하므로 낮춘다 (출력 토큰 = 가장 비싼 부분)
+    report_effort: str = "low"
     route_effort: str = "low"
 
     # 조사 한 번의 상한 (호출 수, 시간, 비용)

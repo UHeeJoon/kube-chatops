@@ -202,10 +202,15 @@ if (!firing.length) return [];
 const a = firing[0];
 const name = a.labels?.alertname ?? 'alert';
 const summary = a.annotations?.summary ?? '';
-const lines = firing.map(x => `• ${x.labels?.alertname} ${x.labels?.pod ?? x.labels?.service ?? ''} ${x.annotations?.summary ?? ''}`.trim());
+const kst = t => new Date(t).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hour12: false });
+// 알림이 하나면 한 줄, 여러 개면 대상별 목록
+const head = `:rotating_light: *${name}* · ${summary}`;
+const more = firing.length > 1
+  ? '\\n' + firing.slice(0, 5).map(x => `• ${x.labels?.pod ?? x.labels?.service ?? x.labels?.namespace ?? ''} ${x.annotations?.summary ?? ''}`.trim()).join('\\n')
+  : '';
+const meta = `\\n_${a.labels?.namespace ?? ''} · ${a.labels?.severity ?? ''} · ${kst(a.startsAt)} 시작 · 이 스레드에 자동 조사 결과가 달립니다_`;
 return [{ json: {
-  title: `:rotating_light: *${name}* (${firing.length}건) ${summary}`,
-  detail: lines.join('\\n').slice(0, 2500),
+  title: head + more + meta,
   question: `알림 '${name}' 이(가) 발생했다. ${summary} 원인을 조사해줘.`,
   alert: { status: g.status, commonLabels: g.commonLabels, commonAnnotations: g.commonAnnotations,
            alerts: firing.slice(0, 5).map(x => ({ labels: x.labels, annotations: x.annotations, startsAt: x.startsAt })) },
@@ -226,47 +231,57 @@ return [{ json: { channel_id: it.channel_id, thread_id: it.thread_id, question: 
   agent_thread: `slack-${it.channel_id}-${it.thread_id}` } }];
 """
 REPORT = r"""
-// agent 보고서 → Slack 블록
+// agent 결과 → Slack 메시지 (mrkdwn). 보고서는 상태 한 줄 + 영향/원인/조치/미확인 목록, 질문 답은 그대로.
 const req = $('조사 요청').item.json;
 const res = $json;
 const secs = Math.round((Date.now() - req.started_at) / 1000);
-const clip = (s, n) => (s ?? '').length > n ? s.slice(0, n - 1) + '…' : (s ?? '');
-let blocks = [], text, result;
+const clip = (s, n) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+const list = (xs, n, w) => (xs ?? []).slice(0, n).map(x => `• ${clip(x, w)}`).join('\n');
+// 모델이 일반 마크다운을 쓰면 Slack 형식으로 바꾼다 (**굵게** → *굵게*, - 목록 → •, # 제목 → 굵게)
+const toSlack = t => String(t ?? '')
+  .replace(/\*\*(.+?)\*\*/g, '*$1*')
+  .replace(/^\s*[-*] /gm, '• ')
+  .replace(/^#{1,6}\s*(.+)$/gm, '*$1*');
 const u0 = res.body?.usage ?? {};
 const cost = (u0.cost_usd ?? 0) + (req.route_cost ?? 0);  // 의도 분류 비용까지 합친 요청 하나의 비용
 const llm = (u0.llm_calls ?? 0) + (req.route_cost ? 1 : 0);
+const stopped = res.body?.stopped_by && res.body.stopped_by !== 'done' ? ` · 한도 도달로 중단(${res.body.stopped_by})` : '';
+const foot = { type: 'context', elements: [{ type: 'mrkdwn',
+  text: `도구 ${res.body?.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초${stopped}` }] };
+const sec = t => ({ type: 'section', text: { type: 'mrkdwn', text: clip(t, 2900) } });
+let blocks = [], text, result;
 if (res.statusCode === 200 && res.body?.mode === 'answer' && res.body?.answer) {
-  // 단순 조회: 모델의 답을 그대로, 아래에 한 줄 정보만
   result = 'answer';
-  text = clip(res.body.answer, 300);
-  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(res.body.answer, 2900) } });
-  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn',
-    text: `도구 ${res.body.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초` }] });
+  const a = toSlack(res.body.answer);
+  text = clip(a, 300);
+  blocks = [sec(a), foot];
 } else if (res.statusCode === 200 && res.body?.report) {
-  const r = res.body.report, u = res.body.usage ?? {};
+  const r = res.body.report;
   result = 'ok';
-  text = clip(r.summary, 300);
-  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(`*조사 결과*\n${r.summary}`, 2900) } });
+  const icon = { critical: ':red_circle:', warning: ':large_yellow_circle:', ok: ':large_green_circle:' }[r.status] ?? ':white_circle:';
+  const label = { critical: '장애', warning: '주의', ok: '정상' }[r.status] ?? '';
+  text = `${label} · ${clip(r.headline, 200)}`;
+  blocks.push(sec(`${icon} *${label}* · ${clip(r.headline, 150)}`));
+  if (r.impact?.length) blocks.push(sec(`*영향*\n${list(r.impact, 3, 90)}`));
   if (r.causes?.length) {
-    const lines = r.causes.map((c, i) => `${i + 1}. *${c.title}* (신뢰도 ${Math.round((c.confidence ?? 0) * 100)}%)\n` +
-      (c.evidence ?? []).slice(0, 4).map(e => `    · ${e}`).join('\n'));
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(`*원인 후보*\n${lines.join('\n')}`, 2900) } });
+    const lines = r.causes.slice(0, 2).map((c, i) =>
+      `${i + 1}. ${clip(c.title, 90)}  \`${Math.round((c.confidence ?? 0) * 100)}%\`\n` +
+      (c.evidence ?? []).slice(0, 3).map(e => `      ◦ ${clip(e, 90)}`).join('\n'));
+    blocks.push(sec(`*원인*\n${lines.join('\n')}`));
   }
-  const acts = (r.actions ?? []).filter(a => a.type !== 'none');
+  const risk = { low: '낮음', medium: '중간', high: '높음' };
+  const acts = (r.actions ?? []).filter(a => a.type !== 'none').slice(0, 2);
   if (acts.length) {
-    const lines = acts.map(a => `• \`${a.type}\` ${a.target} (위험: ${a.risk}) ${a.reason}`);
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(`*제안 조치* (실행하지 않았습니다)\n${lines.join('\n')}`, 2900) } });
+    blocks.push(sec(`*조치 제안* _(승인 전에는 실행하지 않음)_\n` +
+      acts.map(a => `• \`${a.type}\` ${a.target} · 위험 ${risk[a.risk] ?? a.risk}\n      ◦ ${clip(a.reason, 90)}`).join('\n')));
   }
-  if (r.data_gaps?.length) {
-    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: clip(`더 확인할 것: ${r.data_gaps.join(' / ')}`, 2900) }] });
-  }
-  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn',
-    text: `도구 ${res.body.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초` +
-          (res.body.stopped_by && res.body.stopped_by !== 'done' ? ` · 한도 도달로 중단(${res.body.stopped_by})` : '') }] });
+  if (r.data_gaps?.length) blocks.push(sec(`*확인 못 한 것*\n${list(r.data_gaps, 2, 90)}`));
+  blocks.push({ type: 'divider' });
+  blocks.push(foot);
 } else if (res.statusCode === 429) {
-  result = 'budget'; text = '오늘 AI 사용 예산을 다 써서 조사하지 못했습니다.';
+  result = 'budget'; text = ':warning: 오늘 AI 사용 예산을 다 써서 조사하지 못했습니다.';
 } else {
-  result = 'error'; text = `조사에 실패했습니다 (agent ${res.statusCode ?? '연결 실패'}). 잠시 후 다시 시도해 주세요.`;
+  result = 'error'; text = `:warning: 조사에 실패했습니다 (agent ${res.statusCode ?? '연결 실패'}). 잠시 후 다시 시도해 주세요.`;
 }
 return [{ json: { channel: req.channel_id, ts: $('조사 중 표시').item.json.body?.ts, text, blocks: blocks.length ? blocks : null,
   audit: { flow: 'wf-02-investigate', result, source: req.source, user_id: req.user_id, role: req.role,
@@ -281,7 +296,7 @@ investigate = workflow(W, "WF-02 investigate (조사와 보고)", [
     webhook(W, "Alertmanager", (0, 400), "alert", "hook_alert"),
     code(W, "알림 정리", (220, 400), ALERT_PREP),
     http(W, "알림 글 올리기", (440, 400), "POST", f"{GATEWAY}/slack/post",
-         "={{ JSON.stringify({ text: $json.title + '\\n' + $json.detail }) }}", "gateway"),
+         "={{ JSON.stringify({ text: $json.title }) }}", "gateway"),
     code(W, "알림 스레드", (660, 400), ALERT_THREAD),
     code(W, "조사 요청", (880, 200), REQ),
     http(W, "조사 중 표시", (1100, 200), "POST", f"{GATEWAY}/slack/post",

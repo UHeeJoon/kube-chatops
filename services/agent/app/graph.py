@@ -165,7 +165,7 @@ async def report(state: State, runtime: Runtime[Ctx]) -> dict:
     note = REPORT_INSTRUCTION + (f"\n(조사 상한 '{stopped}' 에 도달해 조사를 멈췄습니다. data_gaps 에 무엇을 더 확인해야 하는지 적으세요.)" if stopped else "")
     ask = {"role": "user", "content": note}
     resp = await _llm(
-        ctx, "report", model=settings.model, effort=settings.investigate_effort, system=INVESTIGATE_SYSTEM,
+        ctx, "report", model=settings.model, effort=settings.report_effort, system=INVESTIGATE_SYSTEM,
         messages=state["messages"] + [ask], tools=ctx.toolbox.tools, tool_choice={"type": "none"},
         output_config={"format": {"type": "json_schema", "schema": REPORT_SCHEMA}},
     )
@@ -203,9 +203,10 @@ async def answer(state: State, runtime: Runtime[Ctx]) -> dict:
 
 
 async def refused(state: State, runtime: Runtime[Ctx]) -> dict:
-    data = {"summary": "모델이 이 요청에 대한 답변을 거절했습니다. 질문을 바꿔 다시 요청하거나 사람이 직접 확인하세요.", "causes": [], "actions": [], "data_gaps": []}
+    msg = "모델이 이 요청에 대한 답변을 거절함. 질문을 바꾸거나 사람이 직접 확인 필요"
+    data = {"status": "warning", "headline": msg, "impact": [], "causes": [], "actions": [], "data_gaps": []}
     # 다음 턴이 이어질 수 있도록 대화를 assistant 응답으로 닫는다
-    return {"messages": [{"role": "assistant", "content": data["summary"]}], "report": data, "answer": data["summary"], "stopped_by": "refusal"}
+    return {"messages": [{"role": "assistant", "content": msg}], "report": data, "answer": msg, "stopped_by": "refusal"}
 
 
 # ── 분기 ─────────────────────────────────────────────────────────────
