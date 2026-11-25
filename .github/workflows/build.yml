@@ -1,0 +1,124 @@
+# 바뀐 서비스만 이미지로 빌드 → ghcr.io 푸시 → cosign 서명(keyless) → kube-chatops-deploy 에 digest bump.
+# 서비스 = Dockerfile 이 있는 services/*, demo/* 폴더. 이미지 이름 = 폴더 이름.
+name: build
+on:
+  push:
+    branches: [main]
+    paths: ["services/**", "demo/**", ".github/workflows/build.yml"]
+  workflow_dispatch:
+    inputs:
+      all:
+        description: 모든 서비스 빌드
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io/uheejoon/kube-chatops
+  DEPLOY_REPO: UHeeJoon/kube-chatops-deploy
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      any: ${{ steps.find.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: find
+        env:
+          BEFORE: ${{ github.event.before }}
+          ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.all }}
+        run: |
+          all=$(ls -d services/*/ demo/*/ 2>/dev/null | sed 's#/$##' | while read d; do [ -f "$d/Dockerfile" ] && echo "$d"; done)
+          if [ "$ALL" = "true" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+             || git diff --name-only "$BEFORE" HEAD | grep -q '^.github/workflows/build.yml$'; then
+            dirs="$all"
+          else
+            changed=$(git diff --name-only "$BEFORE" HEAD)
+            dirs=$(for d in $all; do grep -q "^$d/" <<<"$changed" && echo "$d"; done)
+          fi
+          matrix=$(for d in $dirs; do jq -cn --arg p "$d" '{path:$p, name:($p|split("/")[-1])}'; done | jq -cs '{include: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "any=$([ -n "$dirs" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "빌드 대상: $(echo $dirs)"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless 서명 (GitHub OIDC)
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.changes.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.path }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ matrix.name }}:${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: false
+      - uses: sigstore/cosign-installer@v3
+      - name: 서명
+        run: cosign sign --yes "${{ env.REGISTRY }}/${{ matrix.name }}@${{ steps.push.outputs.digest }}"
+      - name: digest 기록
+        run: |
+          mkdir -p out
+          echo "${{ env.REGISTRY }}/${{ matrix.name }}@${{ steps.push.outputs.digest }}" > "out/${{ matrix.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.name }}
+          path: out/${{ matrix.name }}
+
+  bump:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          ssh-key: ${{ secrets.DEPLOY_REPO_KEY }}
+          path: deploy
+      - name: 배포 저장소 digest 갱신
+        working-directory: deploy
+        run: |
+          git config user.name "kube-chatops-ci"
+          git config user.email "kube-chatops-ci@users.noreply.github.com"
+          changed=()
+          for f in ../digests/*; do
+            name=$(basename "$f"); ref=$(cat "$f"); repo=${ref%@*}
+            files=$(grep -rlE "${repo}@sha256:[0-9a-f]{64}" --include='*.yaml' . || true)
+            if [ -z "$files" ]; then echo "::warning::$name 을 쓰는 매니페스트 없음 (처음 배포라면 직접 추가)"; continue; fi
+            sed -i -E "s#${repo}@sha256:[0-9a-f]{64}#${ref}#g" $files
+            changed+=("$name")
+          done
+          git diff --quiet && { echo "변경 없음"; exit 0; }
+          git commit -am "chore(${changed[*]// /,}): 이미지 갱신 ${GITHUB_SHA::7}" -m "source: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done; exit 1
