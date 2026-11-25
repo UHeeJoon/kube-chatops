@@ -24,7 +24,7 @@ PRICES = {
 FALLBACK_PRICE = (10.0, 50.0)
 
 TOKENS = Counter("agent_llm_tokens_total", "LLM 토큰 수", ["model", "kind"])
-COST = Counter("agent_llm_cost_usd_total", "LLM 비용 (USD, 추정). stage: route, investigate, report", ["model", "stage"])
+COST = Counter("agent_llm_cost_usd_total", "LLM 비용 (USD, 추정). stage: route, investigate, report, answer", ["model", "stage"])
 SPENT_TODAY = Gauge("agent_budget_spent_today_usd", "오늘 누적 비용 (USD)")
 BUDGET_LIMIT = Gauge("agent_budget_daily_limit_usd", "하루 예산 (USD)")
 BUDGET_LIMIT.set(settings.daily_budget_usd)
@@ -106,7 +106,7 @@ class Ledger:
 # 라벨 조합을 0 으로 미리 만든다. 카운터가 처음 생길 때의 값은 increase()/rate() 에 잡히지 않아서
 # (첫 샘플이 이미 0 이 아님) 대시보드의 24시간 비용이 실제보다 작게 나온다.
 for _model in PRICES:
-    for _stage in ("route", "investigate", "report"):
+    for _stage in ("route", "investigate", "report", "answer"):
         COST.labels(_model, _stage)
     for _kind in ("input", "cache_write", "cache_read", "output"):
         TOKENS.labels(_model, _kind)

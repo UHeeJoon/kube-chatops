@@ -141,13 +141,14 @@ if (role === 'none') {{
 return [{{ json: {{ ...ev, role, mode, reply, started_at: Date.now() }} }}];
 """
 DECIDE = """
-// /route 결과로 다음 단계를 정한다. investigate, query → 조사. 나머지는 바로 답장.
+// /route 결과로 다음 단계를 정한다. investigate → 조사 보고서, query → 짧은 답(answer 모드). 나머지는 바로 답장.
 const ev = $('준비').item.json;
 const res = $json;
-let next = 'reply', reply = '', intent = 'error';
+let next = 'reply', reply = '', intent = 'error', mode = 'investigate';
 if (res.statusCode === 200) {
   intent = res.body.intent;
   if (intent === 'investigate' || intent === 'query') next = 'investigate';
+  if (intent === 'query') mode = 'answer';
   else if (intent === 'action_request') reply = '조치 실행은 조사 보고서의 승인 버튼으로만 할 수 있습니다 (승인 흐름 준비 중). 먼저 무엇이 문제인지 물어봐 주세요.';
   else if (intent === 'mlops') reply = '재학습과 모델 승격은 MLOps 단계에서 붙습니다.';
   else reply = res.body.reply || '네.';
@@ -156,7 +157,7 @@ if (res.statusCode === 200) {
 } else {
   reply = `요청을 처리하지 못했습니다 (agent ${res.statusCode ?? '연결 실패'}).`;
 }
-return [{ json: { ...ev, intent, next, reply, question: ev.text, route_cost: res.body?.usage?.cost_usd ?? 0 } }];
+return [{ json: { ...ev, intent, next, reply, mode, question: ev.text, route_cost: res.body?.usage?.cost_usd ?? 0 } }];
 """
 AUDIT_REPLY = """
 return [{ json: { flow: 'wf-01-intake', result: $('답장 정리').item.json.result, user_id: $('답장 정리').item.json.user_id,
@@ -220,6 +221,7 @@ REQ = """
 // 두 입구(WF-01, 알림)를 같은 모양으로. agent 의 thread_id 는 Slack 채널 + 스레드 → 후속 질문이 이어진다.
 const it = $json;
 return [{ json: { channel_id: it.channel_id, thread_id: it.thread_id, question: it.question, alert: it.alert ?? null,
+  mode: it.mode === 'answer' ? 'answer' : 'investigate', route_cost: it.route_cost ?? 0,
   user_id: it.user_id, role: it.role, source: it.source ?? 'chat', started_at: it.started_at ?? Date.now(),
   agent_thread: `slack-${it.channel_id}-${it.thread_id}` } }];
 """
@@ -230,7 +232,17 @@ const res = $json;
 const secs = Math.round((Date.now() - req.started_at) / 1000);
 const clip = (s, n) => (s ?? '').length > n ? s.slice(0, n - 1) + '…' : (s ?? '');
 let blocks = [], text, result;
-if (res.statusCode === 200 && res.body?.report) {
+const u0 = res.body?.usage ?? {};
+const cost = (u0.cost_usd ?? 0) + (req.route_cost ?? 0);  // 의도 분류 비용까지 합친 요청 하나의 비용
+const llm = (u0.llm_calls ?? 0) + (req.route_cost ? 1 : 0);
+if (res.statusCode === 200 && res.body?.mode === 'answer' && res.body?.answer) {
+  // 단순 조회: 모델의 답을 그대로, 아래에 한 줄 정보만
+  result = 'answer';
+  text = clip(res.body.answer, 300);
+  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(res.body.answer, 2900) } });
+  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn',
+    text: `도구 ${res.body.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초` }] });
+} else if (res.statusCode === 200 && res.body?.report) {
   const r = res.body.report, u = res.body.usage ?? {};
   result = 'ok';
   text = clip(r.summary, 300);
@@ -249,7 +261,7 @@ if (res.statusCode === 200 && res.body?.report) {
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: clip(`더 확인할 것: ${r.data_gaps.join(' / ')}`, 2900) }] });
   }
   blocks.push({ type: 'context', elements: [{ type: 'mrkdwn',
-    text: `도구 ${res.body.tool_calls ?? 0}회 · LLM ${u.llm_calls ?? 0}회 · $${(u.cost_usd ?? 0).toFixed(3)} · ${secs}초` +
+    text: `도구 ${res.body.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초` +
           (res.body.stopped_by && res.body.stopped_by !== 'done' ? ` · 한도 도달로 중단(${res.body.stopped_by})` : '') }] });
 } else if (res.statusCode === 429) {
   result = 'budget'; text = '오늘 AI 사용 예산을 다 써서 조사하지 못했습니다.';
@@ -259,7 +271,7 @@ if (res.statusCode === 200 && res.body?.report) {
 return [{ json: { channel: req.channel_id, ts: $('조사 중 표시').item.json.body?.ts, text, blocks: blocks.length ? blocks : null,
   audit: { flow: 'wf-02-investigate', result, source: req.source, user_id: req.user_id, role: req.role,
     channel_id: req.channel_id, thread_id: req.thread_id, seconds: secs, agent_status: res.statusCode,
-    cost_usd: res.body?.usage?.cost_usd ?? 0, tool_calls: res.body?.tool_calls ?? 0, stopped_by: res.body?.stopped_by ?? null } } }];
+    mode: req.mode, cost_usd: cost, tool_calls: res.body?.tool_calls ?? 0, stopped_by: res.body?.stopped_by ?? null } } }];
 """
 AUDIT_INV = """
 return [{ json: { ...$('보고서 만들기').item.json.audit, slack_status: $json.statusCode, execution_id: $execution.id } }];
@@ -273,10 +285,10 @@ investigate = workflow(W, "WF-02 investigate (조사와 보고)", [
     code(W, "알림 스레드", (660, 400), ALERT_THREAD),
     code(W, "조사 요청", (880, 200), REQ),
     http(W, "조사 중 표시", (1100, 200), "POST", f"{GATEWAY}/slack/post",
-         "={{ JSON.stringify({ channel: $json.channel_id, thread_ts: $json.thread_id, text: ':mag: 조사하고 있습니다. 보통 30~60초 걸립니다.' }) }}",
+         "={{ JSON.stringify({ channel: $json.channel_id, thread_ts: $json.thread_id, text: $json.mode === 'answer' ? ':hourglass_flowing_sand: 확인하고 있습니다.' : ':mag: 조사하고 있습니다. 보통 30~60초 걸립니다.' }) }}",
          "gateway"),
     http(W, "조사", (1320, 200), "POST", f"{AGENT}/investigate",
-         "={{ JSON.stringify({ thread_id: $('조사 요청').item.json.agent_thread, question: $('조사 요청').item.json.question, alert: $('조사 요청').item.json.alert }) }}",
+         "={{ JSON.stringify({ thread_id: $('조사 요청').item.json.agent_thread, question: $('조사 요청').item.json.question, alert: $('조사 요청').item.json.alert, mode: $('조사 요청').item.json.mode }) }}",
          "agent", timeout_ms=240000),
     code(W, "보고서 만들기", (1540, 200), REPORT),
     http(W, "결과 올리기", (1760, 200), "POST", f"{GATEWAY}/slack/update",

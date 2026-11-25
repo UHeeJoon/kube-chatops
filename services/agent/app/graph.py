@@ -2,9 +2,12 @@
 
 /investigate
     intake ─▶ investigate ─(tool_use)─▶ tools ─(상한 안)─▶ investigate ...
-                   │                      └─(상한 도달)─▶ report ─▶ END
-                   └─(끝남)─────────────────────────────▶ report ─▶ END
+                   │                      └─(상한 도달)─▶ report | answer ─▶ END
+                   └─(끝남)─────────────────────────────▶ report | answer ─▶ END
                    └─(refusal)──────────────────────────▶ refused ─▶ END
+
+- mode="investigate" (장애 조사): 끝나면 report 노드가 구조화 보고서를 만든다.
+- mode="answer" (단순 조회, 후속 질문): 상한과 effort 를 낮추고, 모델의 마지막 답을 그대로 쓴다 (보고서 호출 없음).
 
 - 루프는 LangGraph 노드가 직접 돈다 (SDK tool runner 대신 수동 루프).
   이유: 단계마다 체크포인트가 남고, 호출 수, 시간, 비용 상한을 노드 사이에서 검사해야 하기 때문.
@@ -32,7 +35,7 @@ from opentelemetry import trace
 
 from .budget import Ledger, Usage
 from .config import settings
-from .prompts import INVESTIGATE_SYSTEM, REPORT_INSTRUCTION, REPORT_SCHEMA, ROUTE_SCHEMA, ROUTE_SYSTEM
+from .prompts import ANSWER_INSTRUCTION, INVESTIGATE_SYSTEM, REPORT_INSTRUCTION, REPORT_SCHEMA, ROUTE_SCHEMA, ROUTE_SYSTEM
 from .toolbox import Toolbox
 
 tracer = trace.get_tracer("agent.graph")
@@ -45,6 +48,8 @@ FALLBACK = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"
 class State(TypedDict, total=False):
     messages: Annotated[list[dict[str, Any]], operator.add]
     question: str
+    mode: str  # investigate | answer
+    answer: str | None
     alert: dict[str, Any] | None
     started: float
     llm_calls: int
@@ -86,10 +91,19 @@ def _text(resp) -> str:
     return "".join(b.text for b in resp.content if b.type == "text")
 
 
+def _is_answer(state: State) -> bool:
+    return state.get("mode") == "answer"
+
+
+def _max_tools(state: State) -> int:
+    return settings.answer_max_tool_calls if _is_answer(state) else settings.max_tool_calls
+
+
 def _over_limit(state: State, ctx: Ctx) -> str | None:
-    if state.get("llm_calls", 0) >= settings.max_llm_calls - 1:  # report 한 번은 남겨 둔다
+    max_llm = settings.answer_max_llm_calls if _is_answer(state) else settings.max_llm_calls
+    if state.get("llm_calls", 0) >= max_llm - 1:  # 마지막 답(보고서) 한 번은 남겨 둔다
         return "llm_calls"
-    if state.get("tool_calls", 0) >= settings.max_tool_calls:
+    if state.get("tool_calls", 0) >= _max_tools(state):
         return "tool_calls"
     if time.time() - state.get("started", time.time()) >= settings.max_seconds:
         return "time"
@@ -103,7 +117,8 @@ def _over_limit(state: State, ctx: Ctx) -> str | None:
 
 async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
     now = datetime.now(ZoneInfo(settings.budget_timezone)).strftime("%Y-%m-%d %H:%M %Z")
-    parts = [f"현재 시각: {now}", f"질문: {state['question']}"]
+    kind = "질문 (짧게 답하기)" if _is_answer(state) else "조사 (원인을 찾아 보고)"
+    parts = [f"요청 종류: {kind}", f"현재 시각: {now}", f"질문: {state['question']}"]
     if state.get("alert"):
         # 알림 내용도 외부 입력이므로 데이터로 표시한다
         parts.append("알림 (데이터):\n<alert>\n" + json.dumps(state["alert"], ensure_ascii=False)[:4000] + "\n</alert>")
@@ -113,7 +128,8 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
 async def investigate(state: State, runtime: Runtime[Ctx]) -> dict:
     ctx = runtime.context
     resp = await _llm(
-        ctx, "investigate", model=settings.model, effort=settings.investigate_effort,
+        ctx, "investigate", model=settings.model,
+        effort=settings.answer_effort if _is_answer(state) else settings.investigate_effort,
         system=INVESTIGATE_SYSTEM, messages=state["messages"], tools=ctx.toolbox.tools,
     )
     update: dict[str, Any] = {
@@ -129,7 +145,7 @@ async def investigate(state: State, runtime: Runtime[Ctx]) -> dict:
 async def tools(state: State, runtime: Runtime[Ctx]) -> dict:
     ctx = runtime.context
     calls = [b for b in state["messages"][-1]["content"] if b.get("type") == "tool_use"]
-    allowed = max(0, settings.max_tool_calls - state.get("tool_calls", 0))
+    allowed = max(0, _max_tools(state) - state.get("tool_calls", 0))
 
     async def run(i: int, block: dict) -> dict:
         if i >= allowed:
@@ -165,35 +181,61 @@ async def report(state: State, runtime: Runtime[Ctx]) -> dict:
     }
 
 
+async def answer(state: State, runtime: Runtime[Ctx]) -> dict:
+    """질문 모드의 마지막 단계. 모델이 도구 없이 답을 끝냈으면 그 글을 그대로 쓰고, 상한에 걸렸으면 한 번 더 불러 답을 받는다."""
+    last = state["messages"][-1]
+    if last["role"] == "assistant" and not any(b.get("type") == "tool_use" for b in last["content"]):
+        text = "".join(b.get("text", "") for b in last["content"] if b.get("type") == "text").strip()
+        return {"answer": text or "답을 만들지 못했습니다.", "stopped_by": state.get("stopped_by")}
+    ctx = runtime.context
+    ask = {"role": "user", "content": ANSWER_INSTRUCTION}
+    resp = await _llm(
+        ctx, "answer", model=settings.model, effort=settings.answer_effort, system=INVESTIGATE_SYSTEM,
+        messages=state["messages"] + [ask], tools=ctx.toolbox.tools, tool_choice={"type": "none"},
+    )
+    return {
+        "messages": [ask, {"role": "assistant", "content": _content(resp)}],
+        "answer": _text(resp).strip(),
+        "llm_calls": state.get("llm_calls", 0) + 1,
+        "cost_usd": ctx.usage.cost_usd,
+        "stopped_by": _over_limit(state, ctx),
+    }
+
+
 async def refused(state: State, runtime: Runtime[Ctx]) -> dict:
     data = {"summary": "모델이 이 요청에 대한 답변을 거절했습니다. 질문을 바꿔 다시 요청하거나 사람이 직접 확인하세요.", "causes": [], "actions": [], "data_gaps": []}
     # 다음 턴이 이어질 수 있도록 대화를 assistant 응답으로 닫는다
-    return {"messages": [{"role": "assistant", "content": data["summary"]}], "report": data, "stopped_by": "refusal"}
+    return {"messages": [{"role": "assistant", "content": data["summary"]}], "report": data, "answer": data["summary"], "stopped_by": "refusal"}
 
 
 # ── 분기 ─────────────────────────────────────────────────────────────
 
 
-def after_investigate(state: State) -> Literal["tools", "report", "refused"]:
+def _finish(state: State) -> Literal["report", "answer"]:
+    return "answer" if _is_answer(state) else "report"
+
+
+def after_investigate(state: State) -> Literal["tools", "report", "answer", "refused"]:
     if state.get("stopped_by") == "refusal":
         return "refused"
     last = state["messages"][-1]["content"]
-    return "tools" if any(b.get("type") == "tool_use" for b in last) else "report"
+    return "tools" if any(b.get("type") == "tool_use" for b in last) else _finish(state)
 
 
-def after_tools(state: State, runtime: Runtime[Ctx]) -> Literal["investigate", "report"]:
-    return "report" if _over_limit(state, runtime.context) else "investigate"
+def after_tools(state: State, runtime: Runtime[Ctx]) -> Literal["investigate", "report", "answer"]:
+    return _finish(state) if _over_limit(state, runtime.context) else "investigate"
 
 
 def build(checkpointer) -> Any:
     g = StateGraph(State, context_schema=Ctx)
-    for name, fn in (("intake", intake), ("investigate", investigate), ("tools", tools), ("report", report), ("refused", refused)):
+    for name, fn in (("intake", intake), ("investigate", investigate), ("tools", tools), ("report", report), ("answer", answer), ("refused", refused)):
         g.add_node(name, fn)
     g.add_edge(START, "intake")
     g.add_edge("intake", "investigate")
     g.add_conditional_edges("investigate", after_investigate)
     g.add_conditional_edges("tools", after_tools)
     g.add_edge("report", END)
+    g.add_edge("answer", END)
     g.add_edge("refused", END)
     return g.compile(checkpointer=checkpointer)
 

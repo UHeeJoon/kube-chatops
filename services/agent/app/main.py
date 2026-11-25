@@ -13,7 +13,7 @@ import hmac
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from .telemetry import setup_tracing
 
@@ -51,6 +51,7 @@ class InvestigateIn(BaseModel):
     thread_id: str = Field(min_length=1, max_length=200, description="Slack thread_ts 등. 같은 값이면 대화가 이어진다")
     question: str = Field(min_length=1, max_length=4000)
     alert: dict[str, Any] | None = None
+    mode: Literal["investigate", "answer"] = Field("investigate", description="answer: 단순 조회. 짧은 답, 보고서 없음")
 
 
 class RouteIn(BaseModel):
@@ -125,13 +126,13 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
             async with Toolbox() as toolbox:
                 ctx = g.Ctx(toolbox=toolbox, ledger=state.ledger, usage=usage)
                 # 실행마다 상한 카운터와 결과를 초기화한다 (messages 는 체크포인트에서 이어 붙는다)
-                inp = {"question": body.question, "alert": body.alert, "started": time.time(), "llm_calls": 0, "tool_calls": 0, "cost_usd": 0.0, "stopped_by": None, "report": None}
+                inp = {"question": body.question, "mode": body.mode, "answer": None, "alert": body.alert, "started": time.time(), "llm_calls": 0, "tool_calls": 0, "cost_usd": 0.0, "stopped_by": None, "report": None}
                 out = await state.graph.ainvoke(inp, config={"configurable": {"thread_id": body.thread_id}, "recursion_limit": 60}, context=ctx)
     stopped = out.get("stopped_by") or "done"
     STOPS.labels(stopped).inc()
     REQUESTS.labels("investigate", "200").inc()
     log.info("investigate thread=%s stopped_by=%s tools=%s cost=%.4f", body.thread_id, stopped, out.get("tool_calls"), usage.cost_usd)
-    return {"thread_id": body.thread_id, "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage)}
+    return {"thread_id": body.thread_id, "mode": body.mode, "answer": out.get("answer"), "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage)}
 
 
 @app.exception_handler(Exception)

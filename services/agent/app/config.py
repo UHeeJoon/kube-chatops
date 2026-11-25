@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     daily_budget_usd: float = 5.0
     budget_timezone: str = "Asia/Seoul"
     max_concurrent: int = 2
+    # 질문 모드(단순 조회): 짧은 답, 낮은 effort, 작은 상한, 보고서 단계 없음
+    answer_effort: str = "low"
+    answer_max_llm_calls: int = 4
+    answer_max_tool_calls: int = 5
 
     # MCP 서버: 이름=URL, 토큰은 MCP_TOKEN_<이름 대문자>
     mcp_servers: str = (
