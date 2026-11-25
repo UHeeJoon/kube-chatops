@@ -69,6 +69,8 @@ def to_json(data: Any) -> str:
 def instrumented(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:
     """도구 함수에 메트릭과 감사 로그를 붙인다. 예외는 모델이 읽을 수 있는 오류 문자열로 바꾼다."""
     name = fn.__name__
+    for status in ("ok", "invalid", "error"):  # 0 으로 미리 생성 (increase() 가 첫 호출을 놓치지 않게)
+        TOOL_CALLS.labels(name, status)
 
     @functools.wraps(fn)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> str:

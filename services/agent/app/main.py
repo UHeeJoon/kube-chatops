@@ -39,6 +39,12 @@ log = logging.getLogger("agent")
 REQUESTS = Counter("agent_requests_total", "API 요청 수", ["api", "status"])
 DURATION = Histogram("agent_request_duration_seconds", "API 처리 시간", ["api"], buckets=(1, 2.5, 5, 10, 20, 40, 60, 120, 180, 300))
 STOPS = Counter("agent_investigation_stops_total", "조사 종료 이유", ["reason"])
+for _api in ("route", "investigate"):  # 0 으로 미리 생성 (budget.py 주석 참고)
+    DURATION.labels(_api)
+    for _status in ("200", "401", "429", "500"):
+        REQUESTS.labels(_api, _status)
+for _reason in ("done", "llm_calls", "tool_calls", "time", "cost", "refusal"):
+    STOPS.labels(_reason)
 
 
 class InvestigateIn(BaseModel):

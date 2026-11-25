@@ -101,3 +101,12 @@ class Ledger:
             )
         await self.spent_today()
         return cost
+
+
+# 라벨 조합을 0 으로 미리 만든다. 카운터가 처음 생길 때의 값은 increase()/rate() 에 잡히지 않아서
+# (첫 샘플이 이미 0 이 아님) 대시보드의 24시간 비용이 실제보다 작게 나온다.
+for _model in PRICES:
+    for _stage in ("route", "investigate", "report"):
+        COST.labels(_model, _stage)
+    for _kind in ("input", "cache_write", "cache_read", "output"):
+        TOKENS.labels(_model, _kind)
