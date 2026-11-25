@@ -33,6 +33,7 @@ WF = {"intake": "kcwf01intake0001", "investigate": "kcwf02investig01", "audit": 
 # Slack 사용자 ID → 역할. viewer: 조사와 조회, operator: viewer + 조치 승인 (Day 6).
 # 목록에 없는 사용자의 요청은 거절하고 감사 로그만 남긴다.
 ROLES: dict[str, str] = {
+    "U0B330BGTJA": "operator",  # 프로젝트 운영자 (2026-11-26 등록)
 }
 
 
