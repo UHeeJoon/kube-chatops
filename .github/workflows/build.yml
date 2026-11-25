@@ -38,13 +38,13 @@ jobs:
           BEFORE: ${{ github.event.before }}
           ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.all }}
         run: |
-          all=$(ls -d services/*/ demo/*/ 2>/dev/null | sed 's#/$##' | while read d; do [ -f "$d/Dockerfile" ] && echo "$d"; done)
+          all=$(for d in services/*/ demo/*/; do d=${d%/}; if [ -f "$d/Dockerfile" ]; then echo "$d"; fi; done)
           if [ "$ALL" = "true" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
              || git diff --name-only "$BEFORE" HEAD | grep -q '^.github/workflows/build.yml$'; then
             dirs="$all"
           else
             changed=$(git diff --name-only "$BEFORE" HEAD)
-            dirs=$(for d in $all; do grep -q "^$d/" <<<"$changed" && echo "$d"; done)
+            dirs=$(for d in $all; do if grep -q "^$d/" <<<"$changed"; then echo "$d"; fi; done)
           fi
           matrix=$(for d in $dirs; do jq -cn --arg p "$d" '{path:$p, name:($p|split("/")[-1])}'; done | jq -cs '{include: .}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
