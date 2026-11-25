@@ -11,12 +11,10 @@ class Settings(BaseSettings):
     api_token: SecretStr = Field(min_length=32)
     anthropic_api_key: SecretStr
 
-    # 모델: 기본은 현재 최상위 Opus. /route 는 짧은 분류라 effort 를 낮춘다.
+    # 모델: 조사는 Opus. /route 는 짧은 분류라 Haiku + effort low (Opus 대비 입력 단가 1/40).
     model: str = "claude-opus-5-5"
-    route_model: str = "claude-opus-5-5"
+    route_model: str = "claude-haiku-5-5"
     investigate_effort: str = "medium"
-    # 보고서는 이미 모은 근거를 정리만 하므로 낮춘다 (출력 토큰 = 가장 비싼 부분)
-    report_effort: str = "low"
     route_effort: str = "low"
 
     # 조사 한 번의 상한 (호출 수, 시간, 비용)
@@ -28,8 +26,7 @@ class Settings(BaseSettings):
     daily_budget_usd: float = 5.0
     budget_timezone: str = "Asia/Seoul"
     max_concurrent: int = 2
-    # 질문 모드(단순 조회): 짧은 답, 낮은 effort, 작은 상한, 보고서 단계 없음
-    answer_effort: str = "low"
+    # 질문 모드(단순 조회): 짧은 답, 작은 상한. effort 는 조사와 같게 둔다 (effort 가 바뀌면 같은 스레드의 대화 캐시가 깨진다)
     answer_max_llm_calls: int = 4
     answer_max_tool_calls: int = 5
 

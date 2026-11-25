@@ -250,7 +250,7 @@ const foot = { type: 'context', elements: [{ type: 'mrkdwn',
   text: `도구 ${res.body?.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초${stopped}` }] };
 const sec = t => ({ type: 'section', text: { type: 'mrkdwn', text: clip(t, 2900) } });
 let blocks = [], text, result;
-if (res.statusCode === 200 && res.body?.mode === 'answer' && res.body?.answer) {
+if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질문 답, 또는 보고서 없이 글로 끝난 조사
   result = 'answer';
   const a = toSlack(res.body.answer);
   text = clip(a, 300);
