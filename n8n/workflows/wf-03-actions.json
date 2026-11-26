@@ -1,0 +1,414 @@
+{
+  "id": "kcwf03actions001",
+  "name": "WF-03 actions (승인 조치)",
+  "active": true,
+  "nodes": [
+    {
+      "id": "7baf9509-cbff-54fc-8811-8a380c755eb5",
+      "name": "WF-01 에서 호출",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "09bbe324-a16a-525e-8396-8dc253777016",
+      "name": "요청 정리",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const ev = $json;\nconst id = ev.action?.id ?? '';\nconst [namespace, pod] = String(ev.action?.value ?? '').split('/');\nlet op = id === 'sec_delete_pod' ? 'delete_pod' : 'unknown', note = '';\nif (ev.role !== 'operator') { op = 'deny'; note = '조치 버튼은 operator 만 누를 수 있습니다.'; }\nelse if (op === 'unknown') note = `모르는 조치입니다 (${id}).`;\nelse if (namespace !== 'demo' || !/^[a-z0-9.-]{1,253}$/.test(pod ?? '')) { op = 'deny'; note = '대상이 올바르지 않습니다.'; }\nreturn [{ json: { ...ev, op, namespace, pod, note } }];"
+      }
+    },
+    {
+      "id": "11ba7b00-7792-588a-bc9d-d4dc644d05fd",
+      "name": "격리 파드 삭제?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e4878775-46bc-5f52-afef-88117e953392",
+              "leftValue": "={{ $json.op === 'delete_pod' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "15704612-f56b-5b81-b26d-8245fbcfdfba",
+      "name": "파드 확인",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        200
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://kubernetes.default.svc/api/v1/namespaces/' + $json.namespace + '/pods/' + $json.pod }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kck8sactions0001",
+          "name": "kubernetes: demo 보안 조치"
+        }
+      }
+    },
+    {
+      "id": "359853fc-e8eb-56ad-8ac9-a52168d5d17a",
+      "name": "확인",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const req = $('요청 정리').item.json;\nconst res = $json;\nconst ok = res.statusCode === 200 && res.body.metadata?.labels?.['security.kube-chatops/quarantine'] === 'true';\nconst note = res.statusCode === 404 ? `\\`${req.pod}\\` 는 이미 없습니다.`\n  : res.statusCode !== 200 ? `파드 조회 실패 (${res.statusCode}).`\n  : ok ? '' : `\\`${req.pod}\\` 는 격리된 파드가 아니라 지우지 않았습니다.`;\nreturn [{ json: { ...req, ok, note, result: ok ? null : 'refused' } }];"
+      }
+    },
+    {
+      "id": "2947a93a-a631-5459-9109-d9305d4ad746",
+      "name": "격리된 파드?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0b6f1a18-9587-5d81-acac-16f7ad9029aa",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d5c67663-9b3a-5f8f-b4c1-dc22eee793d6",
+      "name": "삭제",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        100
+      ],
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ 'https://kubernetes.default.svc/api/v1/namespaces/' + $json.namespace + '/pods/' + $json.pod }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kck8sactions0001",
+          "name": "kubernetes: demo 보안 조치"
+        }
+      }
+    },
+    {
+      "id": "8409ec6a-309a-537c-91f8-4e0f746f93e7",
+      "name": "삭제 결과",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const req = $('확인').item.json;\nconst ok = $json.statusCode === 200 || $json.statusCode === 202;\nreturn [{ json: { ...req, note: ok ? `:wastebasket: 격리 파드 \\`${req.pod}\\` 를 삭제했습니다 (<@${req.user_id}>).` : `삭제 실패 (${$json.statusCode}).`,\n  result: ok ? 'deleted' : 'delete_failed' } }];"
+      }
+    },
+    {
+      "id": "7524e497-0a23-507b-8b0c-e201682d1334",
+      "name": "답장 정리",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const it = $json;\nreturn [{ json: { channel: it.channel_id, thread_ts: it.thread_id, text: it.note || '처리했습니다.',\n  audit: { flow: 'wf-03-actions', result: it.result ?? it.op, op: it.op, target: it.pod ? `${it.namespace}/${it.pod}` : null,\n    user_id: it.user_id, role: it.role, channel_id: it.channel_id, thread_id: it.thread_id } } }];"
+      }
+    },
+    {
+      "id": "95e5367b-1c89-53ea-9ccf-c1870b23fa59",
+      "name": "답장",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://chat-gateway.aiops.svc:8080/slack/post",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: $json.channel, thread_ts: $json.thread_ts, text: $json.text, blocks: $json.blocks ?? null }) }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kcgatewayapi0001",
+          "name": "chat-gateway API"
+        }
+      }
+    },
+    {
+      "id": "8e8b0cf9-1f1a-52c9-8123-3c8dcfe4822a",
+      "name": "감사 기록",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        300
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: { ...$('답장 정리').item.json.audit, slack_status: $json.statusCode, execution_id: $execution.id } }];"
+      }
+    },
+    {
+      "id": "85fa300f-5919-5389-8ed1-cc84fe7960ae",
+      "name": "감사 (WF-99)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2420,
+        300
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "kcwf99audit00001",
+          "mode": "id"
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "WF-01 에서 호출": {
+      "main": [
+        [
+          {
+            "node": "요청 정리",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "요청 정리": {
+      "main": [
+        [
+          {
+            "node": "격리 파드 삭제?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "격리 파드 삭제?": {
+      "main": [
+        [
+          {
+            "node": "파드 확인",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "답장 정리",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "파드 확인": {
+      "main": [
+        [
+          {
+            "node": "확인",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "확인": {
+      "main": [
+        [
+          {
+            "node": "격리된 파드?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "격리된 파드?": {
+      "main": [
+        [
+          {
+            "node": "삭제",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "답장 정리",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "삭제": {
+      "main": [
+        [
+          {
+            "node": "삭제 결과",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "삭제 결과": {
+      "main": [
+        [
+          {
+            "node": "답장 정리",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "답장 정리": {
+      "main": [
+        [
+          {
+            "node": "답장",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "답장": {
+      "main": [
+        [
+          {
+            "node": "감사 기록",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "감사 기록": {
+      "main": [
+        [
+          {
+            "node": "감사 (WF-99)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "errorWorkflow": "kcwf99audit00001"
+  },
+  "pinData": {},
+  "tags": []
+}

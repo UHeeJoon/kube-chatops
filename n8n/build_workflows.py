@@ -5,7 +5,8 @@ n8n 화면에서 만든 워크플로는 내보내기 JSON 이 길고 diff 를 �
 가져가고, n8n 파드가 시작할 때 init 컨테이너가 import 한다 (ID 가 고정이라 다시 import 하면 덮어쓴다).
 
 - WF-01 intake: chat-gateway 이벤트 → 권한 확인 → agent /route → 조사(WF-02) 또는 바로 답장
-- WF-02 investigate: WF-01 또는 Alertmanager → agent /investigate → 스레드에 보고서
+- WF-02 investigate: WF-01 또는 Alertmanager → (보안 알림이면 먼저 파드 격리) → agent /investigate → 스레드에 보고서
+- WF-03 actions: Slack 조치 버튼 → operator 확인 → 실행 (지금은 격리 파드 삭제)
 - WF-04 mlops: 학습 결과 카드(Argo onExit → webhook), 모델 상태, 재학습 버튼, 승격 버튼 → 배포 저장소 커밋 → 반영 확인 → champion
 - WF-99 audit: 각 흐름의 결과와 오류를 chat-gateway /audit 로 → Loki
 """
@@ -37,8 +38,11 @@ CRED = {
     "hook_mlops": {"id": "kchookmlops00001", "name": "webhook: 학습 파이프라인"},
     "k8s": {"id": "kck8smlops000001", "name": "kubernetes: mlops 워크플로 제출"},
     "github": {"id": "kcgithubdeploy01", "name": "github: kube-chatops-deploy"},
+    "k8s_actions": {"id": "kck8sactions0001", "name": "kubernetes: demo 보안 조치"},
 }
-WF = {"intake": "kcwf01intake0001", "investigate": "kcwf02investig01", "mlops": "kcwf04mlops00001", "audit": "kcwf99audit00001"}
+WF = {"intake": "kcwf01intake0001", "investigate": "kcwf02investig01", "actions": "kcwf03actions001", "mlops": "kcwf04mlops00001",
+      "audit": "kcwf99audit00001"}
+QUARANTINE_LABEL = "security.kube-chatops/quarantine"  # 이 라벨이 붙은 파드는 demo/security 의 CiliumNetworkPolicy 가 모든 통신을 막는다
 
 # Slack 사용자 ID → 역할. viewer: 조사와 조회, operator: viewer + 조치 승인 (Day 6).
 # 목록에 없는 사용자의 요청은 거절하고 감사 로그만 남긴다.
@@ -143,6 +147,8 @@ if (role === 'none') {{
   reply = `권한이 없습니다. 운영자에게 사용자 ID \\`${{ev.user_id}}\\` 등록을 요청하세요.`;
 }} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('mlops_')) {{
   mode = 'mlops';  // 재학습·승격 버튼 → WF-04 (역할 확인은 WF-04 가 한다)
+}} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('sec_')) {{
+  mode = 'security';  // 보안 조치 버튼 → WF-03 (역할 확인은 WF-03 가 한다)
 }} else if (ev.type === 'button_click') {{
   mode = 'reply';
   reply = '승인 버튼 처리는 아직 준비 중입니다.';
@@ -186,6 +192,9 @@ intake = workflow(W, "WF-01 intake (Slack 이벤트)", [
     webhook(W, "Slack 이벤트", (0, 300), "chat", "hook_chat"),
     code(W, "준비", (220, 300), PREPARE),
     if_true(W, "분류 필요?", (440, 300), "={{ $json.mode === 'route' }}"),
+    if_true(W, "보안 조치?", (660, 550), "={{ $json.mode === 'security' }}"),
+    node(W, "조치 (WF-03)", "n8n-nodes-base.executeWorkflow", 1.2, (880, 450),
+         {"workflowId": {"__rl": True, "value": WF["actions"], "mode": "id"}, "options": {"waitForSubWorkflow": False}}),
     if_true(W, "MLOps?", (1100, 550), "={{ $json.mode === 'mlops' || $json.next === 'mlops' }}"),
     node(W, "MLOps (WF-04)", "n8n-nodes-base.executeWorkflow", 1.2, (1320, 650),
          {"workflowId": {"__rl": True, "value": WF["mlops"], "mode": "id"}, "options": {"waitForSubWorkflow": False}}),
@@ -201,7 +210,8 @@ intake = workflow(W, "WF-01 intake (Slack 이벤트)", [
     call_audit(W, "감사 (WF-99)", (1980, 400)),
 ], links(
     ("Slack 이벤트", "준비"), ("준비", "분류 필요?"),
-    ("분류 필요?", "의도 분류", 0), ("분류 필요?", "MLOps?", 1),
+    ("분류 필요?", "의도 분류", 0), ("분류 필요?", "보안 조치?", 1),
+    ("보안 조치?", "조치 (WF-03)", 0), ("보안 조치?", "MLOps?", 1),
     ("의도 분류", "다음 단계"), ("다음 단계", "조사?"),
     ("조사?", "조사 시작 (WF-02)", 0), ("조사?", "MLOps?", 1),
     ("MLOps?", "MLOps (WF-04)", 0), ("MLOps?", "답장 정리", 1),
@@ -225,18 +235,56 @@ const more = firing.length > 1
   ? '\\n' + firing.slice(0, 5).map(x => `• ${x.labels?.pod ?? x.labels?.service ?? x.labels?.namespace ?? ''} ${x.annotations?.summary ?? ''}`.trim()).join('\\n')
   : '';
 const meta = `\\n_${a.labels?.namespace ?? ''} · ${a.labels?.severity ?? ''} · ${kst(a.startsAt)} 시작 · 이 스레드에 자동 조사 결과가 달립니다_`;
+// 선 조치: auto_action=quarantine 알림이면 가장 최근에 시작된 대상 파드 하나를 격리한다 (demo 만)
+const target = firing.filter(x => x.labels?.auto_action === 'quarantine' && x.labels?.pod && x.labels?.namespace === 'demo')
+  .sort((x, y) => String(y.startsAt).localeCompare(String(x.startsAt)))[0];
 return [{ json: {
+  quarantine: target ? { namespace: target.labels.namespace, pod: target.labels.pod, reason: name } : null,
   title: head + more + meta,
   question: `알림 '${name}' 이(가) 발생했다. ${summary} 원인을 조사해줘.`,
   alert: { status: g.status, commonLabels: g.commonLabels, commonAnnotations: g.commonAnnotations,
            alerts: firing.slice(0, 5).map(x => ({ labels: x.labels, annotations: x.annotations, startsAt: x.startsAt })) },
 } }];
 """
-ALERT_THREAD = """
+QUARANTINE_PLAN = """
+// 격리 계획: 파드의 라벨을 전부 떼고(→ Deployment·Service 에서 빠지고 새 파드가 대신 뜸) 격리 라벨을 붙인다.
+// 떼어 낸 라벨은 어노테이션에 남겨 어느 앱이었는지 알 수 있게 한다. 파드는 지우지 않는다 (증거 보존).
+const q = $('알림 정리').item.json.quarantine;
+const res = $json;
+if (res.statusCode === 404) return [{ json: { ...q, do: false, note: '파드가 이미 없음' } }];
+if (res.statusCode !== 200) return [{ json: { ...q, do: false, note: `파드 조회 실패 (${res.statusCode})` } }];
+const labels = res.body.metadata?.labels ?? {};
+if (labels['__QL__'] === 'true') return [{ json: { ...q, do: false, already: true, note: '이미 격리됨' } }];
+const patch = { metadata: {
+  labels: { ...Object.fromEntries(Object.keys(labels).map(k => [k, null])), '__QL__': 'true' },
+  annotations: { 'security.kube-chatops/original-labels': JSON.stringify(labels),
+                 'security.kube-chatops/quarantined-at': new Date().toISOString(),
+                 'security.kube-chatops/reason': q.reason } } };
+return [{ json: { ...q, do: true, app: labels['app.kubernetes.io/name'] ?? null, node: res.body.spec?.nodeName ?? null, patch } }];
+""".replace("__QL__", QUARANTINE_LABEL)
+QUARANTINE_DONE = r"""
+// 격리 결과를 알림 글과 조사 질문에 넣는다
 const p = $('알림 정리').item.json;
+const plan = $('격리 계획').item.json;
+let q = { ...p.quarantine, done: false, note: plan.note ?? '' };
+if (plan.do) q = { ...q, app: plan.app, node: plan.node, done: $json.statusCode === 200,
+  note: $json.statusCode === 200 ? '격리함' : `격리 실패 (${$json.statusCode} ${JSON.stringify($json.body?.message ?? '').slice(0, 120)})` };
+else if (plan.already) q.done = true;
+const line = q.done
+  ? `
+:lock: *선 조치: 파드 격리* \`${q.pod}\` · 모든 통신 차단, 서비스에서 제외 (새 파드가 대신 뜸), 파드는 증거로 남김`
+  : `
+:warning: 격리하지 못함: \`${q.pod}\` · ${q.note}`;
+const question = p.question + (q.done
+  ? ` 자동 조치로 파드 ${q.pod} 를 이미 격리했다 (라벨을 떼어 서비스에서 제외, 네트워크 전부 차단, 파드는 남김). 격리 전 공격 흔적과 영향 범위를 조사해줘.`
+  : ` 파드 ${q.pod} 자동 격리는 실패했다: ${q.note}.`);
+return [{ json: { ...p, title: p.title + line, question, quarantine: q } }];
+"""
+ALERT_THREAD = """
+const p = $('격리 반영').isExecuted ? $('격리 반영').item.json : $('알림 정리').item.json;
 if ($json.statusCode !== 200) throw new Error(`알림 글 올리기 실패: ${$json.statusCode} ${JSON.stringify($json.body).slice(0, 200)}`);
 return [{ json: { channel_id: $json.body.channel, thread_id: $json.body.ts, question: p.question, alert: p.alert,
-  user_id: 'alertmanager', role: 'system', source: 'alert', started_at: Date.now() } }];
+  quarantine: p.quarantine ?? null, user_id: 'alertmanager', role: 'system', source: 'alert', started_at: Date.now() } }];
 """
 REQ = """
 // 두 입구(WF-01, 알림)를 같은 모양으로. agent 의 thread_id 는 Slack 채널 + 스레드 → 후속 질문이 이어진다.
@@ -244,6 +292,7 @@ const it = $json;
 return [{ json: { channel_id: it.channel_id, thread_id: it.thread_id, question: it.question, alert: it.alert ?? null,
   mode: it.mode === 'answer' ? 'answer' : 'investigate', route_cost: it.route_cost ?? 0,
   user_id: it.user_id, role: it.role, source: it.source ?? 'chat', started_at: it.started_at ?? Date.now(),
+  quarantine: it.quarantine ?? null,
   agent_thread: `slack-${it.channel_id}-${it.thread_id}` } }];
 """
 REPORT = r"""
@@ -292,6 +341,14 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
       acts.map(a => `• \`${a.type}\` ${a.target} · 위험 ${risk[a.risk] ?? a.risk}\n      ◦ ${clip(a.reason, 90)}`).join('\n')));
   }
   if (r.data_gaps?.length) blocks.push(sec(`*확인 못 한 것*\n${list(r.data_gaps, 2, 90)}`));
+  const q = req.quarantine;
+  if (q?.done) {  // 선 조치로 격리한 파드: 조사가 끝나면 사람이 지운다
+    blocks.push(sec(`:lock: *격리된 파드* \`${q.namespace}/${q.pod}\`\n• 증거 확인: \`kubectl -n ${q.namespace} logs ${q.pod}\` · \`kubectl -n ${q.namespace} exec ${q.pod} -- ...\` (네트워크만 막혀 있음)\n• 원래 라벨은 어노테이션 \`security.kube-chatops/original-labels\``));
+    blocks.push({ type: 'actions', elements: [{ type: 'button', style: 'danger', action_id: 'sec_delete_pod', value: `${q.namespace}/${q.pod}`,
+      text: { type: 'plain_text', text: '격리 파드 삭제 (조사 끝)' },
+      confirm: { title: { type: 'plain_text', text: '격리 파드 삭제' }, confirm: { type: 'plain_text', text: '삭제' }, deny: { type: 'plain_text', text: '취소' },
+        text: { type: 'mrkdwn', text: `\`${q.pod}\` 를 지웁니다. 로그와 파일 같은 증거도 함께 사라집니다.` } } }] });
+  }
   blocks.push({ type: 'divider' });
   blocks.push(foot);
 } else if (res.statusCode === 429) {
@@ -302,7 +359,8 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
 return [{ json: { channel: req.channel_id, ts: $('조사 중 표시').item.json.body?.ts, text, blocks: blocks.length ? blocks : null,
   audit: { flow: 'wf-02-investigate', result, source: req.source, user_id: req.user_id, role: req.role,
     channel_id: req.channel_id, thread_id: req.thread_id, seconds: secs, agent_status: res.statusCode,
-    mode: req.mode, cost_usd: cost, tool_calls: res.body?.tool_calls ?? 0, stopped_by: res.body?.stopped_by ?? null } } }];
+    mode: req.mode, cost_usd: cost, tool_calls: res.body?.tool_calls ?? 0, stopped_by: res.body?.stopped_by ?? null,
+    quarantine: req.quarantine ? `${req.quarantine.pod}:${req.quarantine.done ? 'done' : 'failed'}` : null } } }];
 """
 AUDIT_INV = """
 return [{ json: { ...$('보고서 만들기').item.json.audit, slack_status: $json.statusCode, execution_id: $execution.id } }];
@@ -311,6 +369,15 @@ investigate = workflow(W, "WF-02 investigate (조사와 보고)", [
     node(W, "WF-01 에서 호출", "n8n-nodes-base.executeWorkflowTrigger", 1.1, (0, 100), {"inputSource": "passthrough"}),
     webhook(W, "Alertmanager", (0, 400), "alert", "hook_alert"),
     code(W, "알림 정리", (220, 400), ALERT_PREP),
+    if_true(W, "격리 대상?", (220, 600), "={{ !!$json.quarantine }}"),
+    http(W, "파드 조회", (440, 700), "GET",
+         f"={{{{ '{K8S}/api/v1/namespaces/' + $json.quarantine.namespace + '/pods/' + $json.quarantine.pod }}}}", None, "k8s_actions"),
+    code(W, "격리 계획", (660, 700), QUARANTINE_PLAN),
+    if_true(W, "격리 필요?", (880, 700), "={{ $json.do }}"),
+    http(W, "격리", (1100, 650), "PATCH",
+         f"={{{{ '{K8S}/api/v1/namespaces/' + $json.namespace + '/pods/' + $json.pod }}}}", "={{ JSON.stringify($json.patch) }}",
+         "k8s_actions", headers={"Content-Type": "application/merge-patch+json"}),
+    code(W, "격리 반영", (1320, 700), QUARANTINE_DONE),
     http(W, "알림 글 올리기", (440, 400), "POST", f"{GATEWAY}/slack/post",
          "={{ JSON.stringify({ text: $json.title }) }}", "gateway"),
     code(W, "알림 스레드", (660, 400), ALERT_THREAD),
@@ -328,7 +395,11 @@ investigate = workflow(W, "WF-02 investigate (조사와 보고)", [
     call_audit(W, "감사 (WF-99)", (2200, 200)),
 ], links(
     ("WF-01 에서 호출", "조사 요청"),
-    ("Alertmanager", "알림 정리"), ("알림 정리", "알림 글 올리기"), ("알림 글 올리기", "알림 스레드"), ("알림 스레드", "조사 요청"),
+    ("Alertmanager", "알림 정리"), ("알림 정리", "격리 대상?"),
+    ("격리 대상?", "파드 조회", 0), ("격리 대상?", "알림 글 올리기", 1),
+    ("파드 조회", "격리 계획"), ("격리 계획", "격리 필요?"), ("격리 필요?", "격리", 0), ("격리 필요?", "격리 반영", 1),
+    ("격리", "격리 반영"), ("격리 반영", "알림 글 올리기"),
+    ("알림 글 올리기", "알림 스레드"), ("알림 스레드", "조사 요청"),
     ("조사 요청", "조사 중 표시"), ("조사 중 표시", "조사"), ("조사", "보고서 만들기"), ("보고서 만들기", "결과 올리기"),
     ("결과 올리기", "감사 기록"), ("감사 기록", "감사 (WF-99)"),
 ))
@@ -562,6 +633,67 @@ mlops = workflow(W, "WF-04 mlops (재학습과 승격)", [
     ("Slack 글 정리", "Slack 글"), ("Slack 글", "감사 기록"), ("감사 기록", "감사 (WF-99)"),
 ))
 
+# ---------------- WF-03 actions ----------------
+# Slack 조치 버튼 → operator 확인 → 실행. 지금은 "격리 파드 삭제" 하나.
+# 안전장치: 격리 라벨이 붙은 demo 파드만 지운다 (버튼 값을 바꿔 다른 파드를 지우려 해도 거절).
+W = WF["actions"]
+ACT_REQ = """
+const ev = $json;
+const id = ev.action?.id ?? '';
+const [namespace, pod] = String(ev.action?.value ?? '').split('/');
+let op = id === 'sec_delete_pod' ? 'delete_pod' : 'unknown', note = '';
+if (ev.role !== 'operator') { op = 'deny'; note = '조치 버튼은 operator 만 누를 수 있습니다.'; }
+else if (op === 'unknown') note = `모르는 조치입니다 (${id}).`;
+else if (namespace !== 'demo' || !/^[a-z0-9.-]{1,253}$/.test(pod ?? '')) { op = 'deny'; note = '대상이 올바르지 않습니다.'; }
+return [{ json: { ...ev, op, namespace, pod, note } }];
+"""
+ACT_CHECK = r"""
+const req = $('요청 정리').item.json;
+const res = $json;
+const ok = res.statusCode === 200 && res.body.metadata?.labels?.['__QL__'] === 'true';
+const note = res.statusCode === 404 ? `\`${req.pod}\` 는 이미 없습니다.`
+  : res.statusCode !== 200 ? `파드 조회 실패 (${res.statusCode}).`
+  : ok ? '' : `\`${req.pod}\` 는 격리된 파드가 아니라 지우지 않았습니다.`;
+return [{ json: { ...req, ok, note, result: ok ? null : 'refused' } }];
+""".replace("__QL__", QUARANTINE_LABEL)
+ACT_DONE = r"""
+const req = $('확인').item.json;
+const ok = $json.statusCode === 200 || $json.statusCode === 202;
+return [{ json: { ...req, note: ok ? `:wastebasket: 격리 파드 \`${req.pod}\` 를 삭제했습니다 (<@${req.user_id}>).` : `삭제 실패 (${$json.statusCode}).`,
+  result: ok ? 'deleted' : 'delete_failed' } }];
+"""
+ACT_REPLY = """
+const it = $json;
+return [{ json: { channel: it.channel_id, thread_ts: it.thread_id, text: it.note || '처리했습니다.',
+  audit: { flow: 'wf-03-actions', result: it.result ?? it.op, op: it.op, target: it.pod ? `${it.namespace}/${it.pod}` : null,
+    user_id: it.user_id, role: it.role, channel_id: it.channel_id, thread_id: it.thread_id } } }];
+"""
+AUDIT_03 = """
+return [{ json: { ...$('답장 정리').item.json.audit, slack_status: $json.statusCode, execution_id: $execution.id } }];
+"""
+actions = workflow(W, "WF-03 actions (승인 조치)", [
+    node(W, "WF-01 에서 호출", "n8n-nodes-base.executeWorkflowTrigger", 1.1, (0, 300), {"inputSource": "passthrough"}),
+    code(W, "요청 정리", (220, 300), ACT_REQ),
+    if_true(W, "격리 파드 삭제?", (440, 300), "={{ $json.op === 'delete_pod' }}"),
+    http(W, "파드 확인", (660, 200), "GET",
+         f"={{{{ '{K8S}/api/v1/namespaces/' + $json.namespace + '/pods/' + $json.pod }}}}", None, "k8s_actions"),
+    code(W, "확인", (880, 200), ACT_CHECK),
+    if_true(W, "격리된 파드?", (1100, 200), "={{ $json.ok }}"),
+    http(W, "삭제", (1320, 100), "DELETE",
+         f"={{{{ '{K8S}/api/v1/namespaces/' + $json.namespace + '/pods/' + $json.pod }}}}", None, "k8s_actions"),
+    code(W, "삭제 결과", (1540, 100), ACT_DONE),
+    code(W, "답장 정리", (1760, 300), ACT_REPLY),
+    http(W, "답장", (1980, 300), "POST", f"{GATEWAY}/slack/post", POST_SLACK, "gateway"),
+    code(W, "감사 기록", (2200, 300), AUDIT_03),
+    call_audit(W, "감사 (WF-99)", (2420, 300)),
+], links(
+    ("WF-01 에서 호출", "요청 정리"), ("요청 정리", "격리 파드 삭제?"),
+    ("격리 파드 삭제?", "파드 확인", 0), ("격리 파드 삭제?", "답장 정리", 1),
+    ("파드 확인", "확인"), ("확인", "격리된 파드?"), ("격리된 파드?", "삭제", 0), ("격리된 파드?", "답장 정리", 1),
+    ("삭제", "삭제 결과"), ("삭제 결과", "답장 정리"),
+    ("답장 정리", "답장"), ("답장", "감사 기록"), ("감사 기록", "감사 (WF-99)"),
+))
+
 # ---------------- WF-99 audit ----------------
 W = WF["audit"]
 ON_ERROR = """
@@ -581,7 +713,8 @@ audit = workflow(W, "WF-99 audit (감사 로그)", [
 
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
-    for wf, fname in ((intake, "wf-01-intake.json"), (investigate, "wf-02-investigate.json"), (mlops, "wf-04-mlops.json"),
+    for wf, fname in ((intake, "wf-01-intake.json"), (investigate, "wf-02-investigate.json"), (actions, "wf-03-actions.json"),
+                      (mlops, "wf-04-mlops.json"),
                       (audit, "wf-99-audit.json")):
         (OUT / fname).write_text(json.dumps(wf, ensure_ascii=False, indent=2) + "\n")
         print(fname, len(wf["nodes"]), "nodes")

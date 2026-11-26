@@ -37,7 +37,7 @@
         300
       ],
       "parameters": {
-        "jsCode": "// chat-gateway 가 보낸 공통 이벤트 JSON (body). 권한을 확인하고 다음 단계를 정한다.\nconst ROLES = {\"U0B330BGTJA\": \"operator\"};\nconst ev = $json.body ?? {};\nconst role = ROLES[ev.user_id] ?? 'none';\nlet mode = 'route', reply = '';\nif (role === 'none') {\n  mode = 'reply';\n  reply = `권한이 없습니다. 운영자에게 사용자 ID \\`${ev.user_id}\\` 등록을 요청하세요.`;\n} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('mlops_')) {\n  mode = 'mlops';  // 재학습·승격 버튼 → WF-04 (역할 확인은 WF-04 가 한다)\n} else if (ev.type === 'button_click') {\n  mode = 'reply';\n  reply = '승인 버튼 처리는 아직 준비 중입니다.';\n} else if (!(ev.text ?? '').trim()) {\n  mode = 'reply';\n  reply = '무엇을 도와드릴까요? 예: \"주문 조회가 느려졌어요, 원인 확인해줘\"';\n}\nreturn [{ json: { ...ev, role, mode, reply, started_at: Date.now() } }];"
+        "jsCode": "// chat-gateway 가 보낸 공통 이벤트 JSON (body). 권한을 확인하고 다음 단계를 정한다.\nconst ROLES = {\"U0B330BGTJA\": \"operator\"};\nconst ev = $json.body ?? {};\nconst role = ROLES[ev.user_id] ?? 'none';\nlet mode = 'route', reply = '';\nif (role === 'none') {\n  mode = 'reply';\n  reply = `권한이 없습니다. 운영자에게 사용자 ID \\`${ev.user_id}\\` 등록을 요청하세요.`;\n} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('mlops_')) {\n  mode = 'mlops';  // 재학습·승격 버튼 → WF-04 (역할 확인은 WF-04 가 한다)\n} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('sec_')) {\n  mode = 'security';  // 보안 조치 버튼 → WF-03 (역할 확인은 WF-03 가 한다)\n} else if (ev.type === 'button_click') {\n  mode = 'reply';\n  reply = '승인 버튼 처리는 아직 준비 중입니다.';\n} else if (!(ev.text ?? '').trim()) {\n  mode = 'reply';\n  reply = '무엇을 도와드릴까요? 예: \"주문 조회가 느려졌어요, 원인 확인해줘\"';\n}\nreturn [{ json: { ...ev, role, mode, reply, started_at: Date.now() } }];"
       }
     },
     {
@@ -72,6 +72,60 @@
           "combinator": "and"
         },
         "options": {}
+      }
+    },
+    {
+      "id": "86fbea4f-3dbc-5dda-aff9-fccb53d65dcb",
+      "name": "보안 조치?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        550
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c5749053-b265-5102-80c8-552a86dfdab7",
+              "leftValue": "={{ $json.mode === 'security' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "22ab3820-af7c-59c9-8d07-667b3422ce3f",
+      "name": "조치 (WF-03)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        450
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "kcwf03actions001",
+          "mode": "id"
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
       }
     },
     {
@@ -338,6 +392,24 @@
         [
           {
             "node": "의도 분류",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "보안 조치?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "보안 조치?": {
+      "main": [
+        [
+          {
+            "node": "조치 (WF-03)",
             "type": "main",
             "index": 0
           }
