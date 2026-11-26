@@ -273,6 +273,26 @@ def summary(workflow: str) -> dict:
     return out
 
 
+def parse_failures(raw: str) -> list[dict]:
+    """Argo {{workflow.failures}} → [{step, message}]. 실패가 없으면 '"null"' 처럼 따옴표가 한 번 더 붙어 온다."""
+    value: object = raw
+    for _ in range(2):  # JSON 문자열 안에 JSON 이 든 경우까지
+        if not isinstance(value, str):
+            break
+        try:
+            value = json.loads(value)
+        except ValueError:
+            break
+    if value in (None, "", "null", []):
+        return []
+    if isinstance(value, list):
+        return [
+            {"step": f.get("displayName"), "message": str(f.get("message") or "")[:200]}
+            for f in value if isinstance(f, dict)
+        ][:3]
+    return [{"message": str(value)[:300]}]
+
+
 def notify(status: str, failures: str = "") -> None:
     """학습이 끝나면(성공·실패 모두) n8n WF-04 로 결과를 보낸다 → Slack 에 결과와 승격 버튼.
 
@@ -284,13 +304,9 @@ def notify(status: str, failures: str = "") -> None:
     payload: dict = {"type": "training_finished", "workflow": workflow, "status": status,
                      "slack": {"channel": os.environ.get("SLACK_CHANNEL") or None,
                                "thread_ts": os.environ.get("SLACK_THREAD") or None}}
-    if failures and failures not in ("null", "[]"):
-        try:
-            payload["failures"] = [
-                {"step": f.get("displayName"), "message": (f.get("message") or "")[:200]} for f in json.loads(failures)
-            ][:3]
-        except ValueError:
-            payload["failures"] = [{"message": failures[:300]}]
+    parsed = parse_failures(failures)
+    if parsed:
+        payload["failures"] = parsed
     try:
         payload |= summary(workflow)
     except Exception as e:  # noqa: BLE001 — MLflow 가 죽어도 실패 알림은 가야 한다

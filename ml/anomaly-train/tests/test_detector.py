@@ -86,3 +86,16 @@ def test_per_feature_z_explains_the_decision():
     latency = (test["kind"] == "latency").to_numpy()
     assert (scored.loc[latency, "z_p95_log_ms"] > 4).all()
     assert (scored.loc[latency, "z_error_ratio"].abs() < 4).all()
+
+
+def test_parse_failures_handles_argo_formats():
+    """Argo 는 실패가 없으면 '"null"', 있으면 JSON 배열(문자열로 한 번 더 감싸일 수 있음)을 넘긴다."""
+    import json
+
+    assert steps.parse_failures('"null"') == []
+    assert steps.parse_failures("null") == []
+    assert steps.parse_failures("") == []
+    one = [{"displayName": "train", "message": "OOMKilled"}]
+    assert steps.parse_failures(json.dumps(one)) == [{"step": "train", "message": "OOMKilled"}]
+    assert steps.parse_failures(json.dumps(json.dumps(one))) == [{"step": "train", "message": "OOMKilled"}]
+    assert steps.parse_failures("not json") == [{"message": "not json"}]
