@@ -4,6 +4,7 @@
 	admin off
 	auto_https off
 	order coraza_waf first
+	order rate_limit before coraza_waf
 	servers {
 		# 실제 클라이언트 IP: 클러스터 안(사설 대역)에서 온 요청의 CF-Connecting-IP 만 믿는다.
 		# 바깥에서 오는 길은 Cloudflare 터널 하나뿐이고 Cloudflare 가 이 헤더를 덮어쓴다.
@@ -27,6 +28,21 @@
 	# 운영용 경로는 게이트웨이 쪽에 내놓지 않는다 (장애 주입은 n8n·스크립트가 demo-app 에 직접 한다)
 	@ops path /chaos/* /metrics /healthz* /readyz
 	respond @ops 404
+
+	# 요청 수 제한: 실제 IP(client_ip, Cloudflare 헤더 반영) 하나당 10초에 100건. 넘으면 429 (Retry-After).
+	# 클러스터 안(load-gen 등 사설 IP)은 빼고 바깥 요청만 센다. 파드 2개가 각자 세서 실제 한도는 최대 2배다.
+	# 걸린 IP 는 로그 한 줄(logger http.handlers.rate_limit, key=IP)로 남는다 → mcp-loki waf_blocks
+	rate_limit {
+		zone per_ip {
+			match {
+				not client_ip private_ranges
+			}
+			key {http.vars.client_ip}
+			window 10s
+			events 100
+		}
+		log_key
+	}
 
 	coraza_waf {
 		load_owasp_crs

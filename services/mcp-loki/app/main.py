@@ -219,6 +219,7 @@ async def waf_blocks(minutes: int = 60, limit: int = 10) -> str:
     """demo 웹 방화벽(Coraza, OWASP CRS)이 막은 요청을 출발 IP 별로 집계한다. WAF 차단 알림을 조사할 때 쓴다.
 
     client_ip 는 실제 접속자 IP 다 (Cloudflare 가 넣는 CF-Connecting-IP. load-gen 같은 클러스터 안 요청은 사설 IP).
+    count = 규칙에 걸려 403 으로 막힌 수, rate_limited = 요청 수 제한(10초 100건)에 걸려 429 로 거절된 수.
     rules 는 걸린 CRS 규칙(id: 설명, 횟수). 942xxx=SQLi, 930xxx=경로 조작, 932xxx=명령 주입, 941xxx=XSS, 913xxx=스캐너, 944xxx=Java(Log4Shell 등), 933xxx=PHP.
     - minutes: 최근 몇 분 (최대 120), limit: 돌려줄 IP 수 (최대 30)
     """
@@ -253,11 +254,27 @@ async def waf_blocks(minutes: int = 60, limit: int = 10) -> str:
             s["user_agents"][ua] = s["user_agents"].get(ua, 0) + 1
             if len(s["samples"]) < 3:
                 s["samples"].append({"time": t, "method": req.get("method"), "uri": str(req.get("uri", ""))[:200]})
-    ips = sorted(by_ip.values(), key=lambda v: v["count"], reverse=True)[:limit]
+    # 요청 수 제한(429)에 걸린 IP: caddy-ratelimit 이 거절할 때마다 남기는 줄 (key = 실제 IP)
+    limited = await _get("query_range", {"query": f'{WAF_SELECTOR} |= "rate limit exceeded"', "start": start, "end": end,
+                                         "limit": SECURITY_SCAN_LINES, "direction": "backward"})
+    total_limited = 0
+    for stream in limited["result"]:
+        for ts, line in stream["values"]:
+            try:
+                ip = json.loads(line).get("key") or "?"
+            except ValueError:
+                continue
+            total_limited += 1
+            t = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts) / 1e9))
+            s = by_ip.setdefault(ip, {"client_ip": ip, "count": 0, "first": t, "last": t, "rules": {}, "user_agents": {}, "samples": []})
+            s["rate_limited"] = s.get("rate_limited", 0) + 1
+            s["first"], s["last"] = min(s["first"], t), max(s["last"], t)
+    ips = sorted(by_ip.values(), key=lambda v: v["count"] + v.get("rate_limited", 0), reverse=True)[:limit]
     for v in ips:
         v["rules"] = dict(sorted(v["rules"].items(), key=lambda kv: kv[1], reverse=True)[:12])
         v["user_agents"] = dict(sorted(v["user_agents"].items(), key=lambda kv: kv[1], reverse=True)[:3])
-    return to_json({"minutes": minutes, "total_blocked": total, "distinct_ips": len(by_ip), "truncated": total >= SECURITY_SCAN_LINES, "by_ip": ips})
+    return to_json({"minutes": minutes, "total_blocked": total, "total_rate_limited": total_limited, "distinct_ips": len(by_ip),
+                    "truncated": total >= SECURITY_SCAN_LINES or total_limited >= SECURITY_SCAN_LINES, "by_ip": ips})
 
 
 if __name__ == "__main__":

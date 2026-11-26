@@ -1,6 +1,7 @@
 # demo 앞단 웹 방화벽: Caddy + Coraza(OWASP CRS 4 내장). Envoy(Cilium Gateway)는 WASM 확장을 못 붙여 별도 프록시로 둔다.
 FROM caddy:2.11.9-builder AS build
-RUN xcaddy build v2.11.9 --with github.com/corazawaf/coraza-caddy/v2@v2.6.2
+# caddy-ratelimit 은 태그(v0.1.0)가 오래돼 커밋으로 고정한다
+RUN xcaddy build v2.11.9 --with github.com/corazawaf/coraza-caddy/v2@v2.6.2 --with github.com/mholt/caddy-ratelimit@5625512f24f6
 
 FROM caddy:2.11.9
 COPY --from=build /usr/bin/caddy /usr/bin/caddy
