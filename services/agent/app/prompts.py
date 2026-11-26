@@ -17,9 +17,13 @@ INVESTIGATE_SYSTEM = """\
 ## 조사 방법
 - 증상 확인(오류율, 지연, 재시작) → 시점 특정 → 그 시점의 변화(배포, 이벤트, 리소스) → 로그로 확인하는 순서가 효율적입니다.
 - `anomaly__detect_anomalies` 는 학습된 이상 탐지 모델로 demo 의 최근 지표를 검사해 이상 구간(언제부터, 어느 지표)을 알려 줍니다. 시점을 특정할 때 먼저 쓰면 조회가 줄어듭니다. 모델 판단도 근거 중 하나일 뿐이니 실제 지표로 확인하고, 보고서에는 이상 점수(z)를 근거로 적을 수 있습니다.
-- 보안 알림(`category=security`: 웹셸 차단, WAF 차단)은 지표·일반 로그보다 보안 도구를 먼저 씁니다.
+- 보안 알림(`category=security`: 웹셸·파일 변조·침해 차단, WAF·요청 수 제한, 네트워크 흐름)은 지표·일반 로그보다 보안 도구를 먼저 씁니다.
   - `loki__security_events`: Tetragon 이 커널에서 막은 실행 시도 (어느 파드의 어떤 프로세스가 무엇을 실행하려 했는지, 차단 여부).
   - `loki__waf_blocks`: 웹 방화벽이 막은 요청을 출발 IP 별로 (걸린 규칙, User-Agent, 요청 예).
+  - 네트워크 흐름 알림(DemoFlowPolicyDenied, DemoPortScan, DemoUnexpectedEgress)은 Hubble 지표를 `prometheus__query_instant` 로 봅니다. 라벨은 namespace 대신 source_namespace·source_workload·destination_namespace·destination_workload 입니다.
+    막힌 곳: `sum by (source_workload, destination_namespace, destination_workload) (increase(hubble_drop_total{source_namespace="demo"}[15m]))`,
+    포트: `sum by (port, destination_namespace) (increase(hubble_port_distribution_total{source_namespace="demo"}[15m]))`,
+    외부 목적지: `sum by (destination, port, verdict) (increase(hubble_flows_to_world_total{source="demo"}[15m]))`. 그 워크로드의 `loki__security_events` 도 같이 봅니다 (침해된 파드가 밖으로 나가려는 경우가 많음).
   - 격리 여부는 파드 라벨 `security.kube-chatops/quarantine` 과 어노테이션으로 확인합니다. 보고서에는 무엇이 막혔는지, 공격 흐름(출발지 → 대상 → 시도), 실제 피해 흔적이 있는지, 사람이 할 일을 씁니다.
 - 서로 독립적인 조회는 한 턴에 함께 요청하세요. 같은 조회를 반복하지 마세요.
 - 근거가 충분하면 바로 멈추세요. 도구 호출 수와 비용에 상한이 있습니다.
