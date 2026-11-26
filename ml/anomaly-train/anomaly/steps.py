@@ -21,7 +21,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
 
 from . import data
-from .detector_model import RAW_COLUMNS, score_frame, standardize, to_features
+from .detector_model import FEATURES, RAW_COLUMNS, score_frame, standardize, to_features
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "demo-anomaly")
 EXPERIMENT = os.environ.get("MLFLOW_EXPERIMENT", "demo-anomaly")
@@ -29,7 +29,11 @@ MODEL_CODE = str(Path(__file__).with_name("detector_model.py"))
 # MLflow 서버가 아티팩트를 프록시하는 위치 (mlflow server --artifacts-destination 과 같아야 함)
 ARTIFACTS_DESTINATION = os.environ.get("MLFLOW_ARTIFACTS_DESTINATION", "s3://mlops/mlflow")
 OUTPUTS = Path(os.environ.get("OUTPUTS_DIR", "/tmp/outputs"))
-SCALE_FLOOR = [0.5, 0.01, 0.1, 0.01]  # FEATURES 순서: rps, error_ratio, p95_log_ms, mem_ratio
+# FEATURES 순서: rps, error_ratio, p95_log_ms, mem_ratio, mem_growth.
+# mem_growth 하한 0.005 = 분당 한도의 0.5% → z=4 경계가 분당 2% (평소 최대 0.3%, 누수 3~8%. 11-26 실측)
+SCALE_FLOOR = [0.5, 0.01, 0.1, 0.01, 0.005]
+RPS_LOW_QUANTILE = 0.01  # 요청 급감 경계 = 학습 기간 요청 수 1% 지점의 절반
+RPS_LOW_FACTOR = 0.5
 
 
 def emit(name: str, value) -> None:
@@ -88,7 +92,8 @@ def fit_bundle(train: pd.DataFrame, quantile: float, z_limit: float, seed: int =
     z = standardize(scaler, x)
     forest = IsolationForest(n_estimators=200, random_state=seed).fit(z)
     threshold = float(np.quantile(-forest.score_samples(z), quantile))
-    return {"scaler": scaler, "forest": forest, "threshold": threshold, "z_limit": z_limit}
+    rps_low = float(np.quantile(x["rps"].dropna(), RPS_LOW_QUANTILE) * RPS_LOW_FACTOR)
+    return {"scaler": scaler, "forest": forest, "threshold": threshold, "z_limit": z_limit, "rps_low": rps_low}
 
 
 def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_limit: float) -> str:
@@ -113,6 +118,11 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
             }
         )
         mlflow.log_metric("threshold", bundle["threshold"])
+        mlflow.log_metric("rps_low", bundle["rps_low"])
+        # 특성별 평소 값과 z=4 경계 (MLflow 화면에서 "무엇을 기준으로 이상인가" 를 볼 수 있게)
+        sc = bundle["scaler"]
+        mlflow.log_metrics({f"normal_mean_{f}": float(m) for f, m in zip(FEATURES, sc.mean_)})
+        mlflow.log_metrics({f"normal_scale_{f}": float(v) for f, v in zip(FEATURES, sc.scale_)})
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "detector.joblib"
             joblib.dump(bundle, path)

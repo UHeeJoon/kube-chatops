@@ -17,6 +17,7 @@ def synthetic(minutes: int = 600, seed: int = 0) -> pd.DataFrame:
             "error_ratio": np.zeros(minutes),  # 평소 오류 0 (실제 demo 와 같음)
             "p95_seconds": 0.0095 + rng.normal(0, 0.0003, minutes),
             "mem_ratio": 0.138 + rng.normal(0, 0.001, minutes),
+            "mem_growth": np.abs(rng.normal(0, 0.0002, minutes)),
             "label": 0,
             "kind": "",
             "ambiguous": False,
@@ -65,7 +66,7 @@ def test_few_false_alarms_on_normal_minutes():
 def test_missing_values_do_not_crash():
     train, _ = steps.split(synthetic(), 0.7)
     bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
-    raw = pd.DataFrame([{"rps": None, "error_ratio": None, "p95_seconds": None, "mem_ratio": None}])
+    raw = pd.DataFrame([{c: None for c in RAW_COLUMNS}])
     out = score_frame(bundle, raw)
     assert len(out) == 1 and out["score"].notna().all()
 
@@ -74,7 +75,7 @@ def test_missing_measurement_is_not_an_anomaly():
     """메모리·지연 수집이 비면 평소 값으로 본다 (0 으로 채우면 '메모리 0%' 이상으로 잡힌다)."""
     train, _ = steps.split(synthetic(), 0.7)
     bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
-    raw = pd.DataFrame([{"rps": 5.0, "error_ratio": None, "p95_seconds": None, "mem_ratio": None}])
+    raw = pd.DataFrame([{**{c: None for c in RAW_COLUMNS}, "rps": 5.0}])
     assert not score_frame(bundle, raw)["is_anomaly"].iloc[0]
 
 
@@ -99,3 +100,28 @@ def test_parse_failures_handles_argo_formats():
     assert steps.parse_failures(json.dumps(one)) == [{"step": "train", "message": "OOMKilled"}]
     assert steps.parse_failures(json.dumps(json.dumps(one))) == [{"step": "train", "message": "OOMKilled"}]
     assert steps.parse_failures("not json") == [{"message": "not json"}]
+
+
+def test_memory_growth_catches_leak_before_memory_is_high():
+    """누수 초반: 메모리는 아직 평소 범위(+2%p)지만 분당 3% 씩 늘고 있으면 이상 (11-26 실측 누수 3~8%/분)."""
+    train, _ = steps.split(synthetic(), 0.7)
+    bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
+    raw = pd.DataFrame([{"rps": 5.0, "error_ratio": 0.0, "p95_seconds": 0.0095, "mem_ratio": 0.158, "mem_growth": 0.03}])
+    out = score_frame(bundle, raw).iloc[0]
+    assert out["is_anomaly"] and out["top_feature"] == "mem_growth"
+    # 메모리 해제(음수 증가)는 이상이 아니다
+    raw.loc[0, ["mem_ratio", "mem_growth"]] = [0.138, -0.05]
+    assert not score_frame(bundle, raw)["is_anomaly"].iloc[0]
+
+
+def test_traffic_drop_detected_although_z_lower_bound_is_negative():
+    """요청 수 표준편차가 커서 z 로는 0 도 못 잡는다 → rps_low 규칙이 잡는다."""
+    df = synthetic()
+    df["rps"] = 5 * (1 + 0.5 * np.sin(np.arange(len(df)) / 60))  # 2.5~7.5 로 크게 오르내림
+    train, _ = steps.split(df, 0.7)
+    bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
+    raw = pd.DataFrame([{"rps": 0.1, "error_ratio": 0.0, "p95_seconds": 0.0095, "mem_ratio": 0.138, "mem_growth": 0.0}])
+    out = score_frame(bundle, raw).iloc[0]
+    assert out["traffic_drop"] and out["is_anomaly"] and out["top_feature"] == "rps"
+    raw.loc[0, "rps"] = 3.0  # 평소 낮은 시간대는 정상
+    assert not score_frame(bundle, raw)["is_anomaly"].iloc[0]

@@ -179,6 +179,8 @@ def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
     M_ANOMALY.labels("hybrid").set(int(p["is_anomaly"]))
     M_ANOMALY.labels("iforest").set(int(p["iforest_anomaly"]))
     M_ANOMALY.labels("zscore").set(int(p["zscore_anomaly"]))
+    if "traffic_drop" in p:  # v6 부터: 요청 급감 규칙
+        M_ANOMALY.labels("traffic_drop").set(int(p["traffic_drop"]))
     M_SCORE.set(p["score"])
     for k, v in p.items():  # 예전 모델(v1)은 z_<특성> 이 없다
         if k.startswith("z_") and v is not None:
