@@ -1,0 +1,50 @@
+# 요청 흐름: Cloudflare → cloudflared → Cilium Gateway(public-gateway) → 이 프록시(WAF) → demo-app
+#           load-gen → 이 프록시 → demo-app (평소 트래픽으로 오탐을 본다)
+{
+	admin off
+	auto_https off
+	order coraza_waf first
+	servers {
+		# 실제 클라이언트 IP: 클러스터 안(사설 대역)에서 온 요청의 CF-Connecting-IP 만 믿는다.
+		# 바깥에서 오는 길은 Cloudflare 터널 하나뿐이고 Cloudflare 가 이 헤더를 덮어쓴다.
+		# 이 파드에 들어올 수 있는 것은 게이트웨이와 load-gen 뿐이다 (CiliumNetworkPolicy).
+		trusted_proxies static private_ranges
+		client_ip_headers CF-Connecting-IP X-Forwarded-For
+		trusted_proxies_strict
+		metrics
+	}
+	log {
+		output stdout
+		format json
+	}
+}
+
+:8080 {
+	# 접근 로그는 남기지 않는다 (평소 초당 5건 → 하루 43만 줄). 차단한 요청만 WAF 로그(실제 IP, 규칙 id)와 감사 로그(JSON)로 남는다
+	# 운영용 경로는 게이트웨이 쪽에 내놓지 않는다 (장애 주입은 n8n·스크립트가 demo-app 에 직접 한다)
+	@ops path /chaos/* /metrics /healthz* /readyz
+	respond @ops 404
+
+	coraza_waf {
+		load_owasp_crs
+		directives `
+			Include @coraza.conf-recommended
+			Include @crs-setup.conf.example
+			Include @owasp_crs/*.conf
+			SecRuleEngine On
+			SecResponseBodyAccess Off
+			SecAuditEngine RelevantOnly
+			SecAuditLogRelevantStatus "^403$"
+			SecAuditLogParts ABHZ
+			SecAuditLogFormat JSON
+			SecAuditLogType Serial
+			SecAuditLog /dev/stdout
+		`
+	}
+	reverse_proxy {$UPSTREAM:demo-app.demo.svc:8080}
+}
+
+# Prometheus 수집용 (요청 수·응답 코드). 게이트웨이에는 내놓지 않는다
+:9180 {
+	metrics
+}
