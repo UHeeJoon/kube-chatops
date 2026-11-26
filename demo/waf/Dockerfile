@@ -4,6 +4,9 @@ RUN xcaddy build v2.11.9 --with github.com/corazawaf/coraza-caddy/v2@v2.6.2
 
 FROM caddy:2.11.9
 COPY --from=build /usr/bin/caddy /usr/bin/caddy
+# 공식 이미지는 80 포트용 cap_net_bind_service 를 파일에 붙인다. 파드는 권한을 모두 빼고(no_new_privs) 8080 만 쓰므로
+# 붙어 있으면 실행 자체가 거부된다 (exec: operation not permitted).
+RUN setcap -r /usr/bin/caddy
 COPY Caddyfile /etc/caddy/Caddyfile
 ENV XDG_DATA_HOME=/tmp/caddy XDG_CONFIG_HOME=/tmp/caddy
 USER 10001:10001
