@@ -170,12 +170,14 @@ def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
     }
     if not series["rps"]:
         raise RuntimeError("demo 요청 지표 없음")
-    ts = max(series["rps"])
-    row = {name: series[name].get(ts) for name in FEATURE_QUERIES}
-    resp = model_sync.post(MODEL_URL, json={"instances": [row]})
+    # 마지막 1분만이 아니라 앞의 몇 분도 함께 보낸다. v7 부터 모델이 IsolationForest 단독 판정을
+    # "바로 앞 1분도 이상일 때만" 인정하므로, 한 줄만 보내면 그 판정이 영영 확정되지 않는다. 판정은 마지막 줄 것을 쓴다.
+    stamps = sorted(series["rps"])
+    rows = [{name: series[name].get(ts) for name in FEATURE_QUERIES} for ts in stamps]
+    resp = model_sync.post(MODEL_URL, json={"instances": rows})
     resp.raise_for_status()
     body = resp.json()
-    p = body["predictions"][0]
+    p = body["predictions"][-1]
     M_ANOMALY.labels("hybrid").set(int(p["is_anomaly"]))
     M_ANOMALY.labels("iforest").set(int(p["iforest_anomaly"]))
     M_ANOMALY.labels("zscore").set(int(p["zscore_anomaly"]))

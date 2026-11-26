@@ -437,11 +437,16 @@ else head = `:warning: *모델 재학습 완료, 평가 미통과* · 등록하�
 const blocks = [sec(head)];
 if (r.f1 !== undefined) {
   const kinds = Object.entries(r.recall_by_kind ?? {}).map(([k, v]) => `${k} ${pct(v)}`).join(' · ') || '-';
+  // 오탐은 분 수와 표본 크기를 같이 보여 준다. 하루 환산만 보면 정상 구간이 짧을 때 크게 부풀려진다 (v6: 0.4일에서 "39회/일").
+  const fa = (r.false_alarm_minutes === null || r.false_alarm_minutes === undefined)
+    ? `${r.false_alarms_per_day ?? '-'}분/일`
+    : `*${r.false_alarm_minutes}분* (${r.false_alarm_events}건, 정상 ${r.normal_days}일 중 · 하루 환산 ${r.false_alarms_per_day}분)` +
+      ((r.champion_false_alarm_minutes === null || r.champion_false_alarm_minutes === undefined) ? '' : ` · 지금 서빙은 같은 데이터에서 ${r.champion_false_alarm_minutes}분`);
   blocks.push(sec(
     `*평가* (정상 뒤쪽 + 장애 구간 ${r.data?.test_anomaly_rows ?? '?'}분)\n` +
     `• F1 *${pct(r.f1)}* · precision ${pct(r.precision)} · recall ${pct(r.recall)}\n` +
     `• 장애 종류별 재현율: ${kinds}\n` +
-    `• 오탐 ${r.false_alarms_per_day ?? '-'}회/일 · 비교: z-score 기준선 ${pct(r.baseline_f1)}, IsolationForest 단독 ${pct(r.iforest_f1)}\n` +
+    `• 오탐 ${fa} · 비교: z-score 기준선 ${pct(r.baseline_f1)}, IsolationForest 단독 ${pct(r.iforest_f1)}\n` +
     `• 지금 서빙(champion): ${champ ? `v${champ.version} · F1 ${pct(champ.f1)}` : '없음'}`));
 }
 if (r.failures?.length) blocks.push(sec('*실패한 단계*\n' + r.failures.map(f => `• ${f.step ?? ''} ${f.message ?? ''}`).join('\n')));

@@ -129,6 +129,68 @@ def test_traffic_drop_detected_although_z_lower_bound_is_negative():
     assert not score_frame(bundle, raw)["is_anomaly"].iloc[0]
 
 
+def _bundle_where_iforest_fires_on(rows: list[bool], z_limit: float = 4.0) -> tuple[dict, pd.DataFrame]:
+    """IsolationForest 만 원하는 행에서 이상으로 답하게 만든 가짜 bundle (z-score·요청 급감은 조용함)."""
+
+    class FakeForest:
+        def score_samples(self, z):
+            return -np.array([1.0 if r else 0.0 for r in rows])
+
+    raw = pd.DataFrame({"rps": 10.0, "error_ratio": 0.0, "p95_seconds": 0.05, "mem_ratio": 0.3, "mem_growth": 0.0},
+                       index=range(len(rows)))
+    scaler = StandardScaler().fit(to_features(raw).to_numpy())
+    scaler.scale_ = np.ones(len(FEATURES))
+    bundle = {"scaler": scaler, "forest": FakeForest(), "threshold": 0.5, "z_limit": z_limit, "rps_low": 1.0,
+              "features": list(FEATURES), "iforest_needs_neighbor": True}
+    return bundle, raw
+
+
+def test_isolated_iforest_minute_is_not_an_anomaly():
+    # 11-27: 정상 구간 오탐이 전부 IsolationForest 단독의 1분짜리였다
+    bundle, raw = _bundle_where_iforest_fires_on([False, True, False, False, True, True, False])
+    scored = score_frame(bundle, raw)
+    assert scored["iforest_anomaly"].tolist() == [False, True, False, False, True, True, False]  # 원래 판정은 그대로 보인다
+    assert scored["is_anomaly"].tolist() == [False, False, False, False, True, True, False]
+
+
+def test_last_minute_is_confirmed_by_the_previous_one_only():
+    # 실시간: 마지막 분은 뒤가 없다. 앞 1분이 이상이면 확정, 아니면 다음 분까지 기다린다
+    bundle, raw = _bundle_where_iforest_fires_on([False, False, True])
+    assert not score_frame(bundle, raw)["is_anomaly"].iloc[-1]
+    bundle, raw = _bundle_where_iforest_fires_on([False, True, True])
+    assert score_frame(bundle, raw)["is_anomaly"].iloc[-1]
+
+
+def test_minutes_across_a_gap_are_not_neighbors():
+    # 평가 데이터는 애매 구간이 빠져 있다. 10분 떨어진 두 행을 이웃으로 보면 안 된다
+    bundle, raw = _bundle_where_iforest_fires_on([True, True])
+    assert score_frame(bundle, raw, minute=np.array([100, 101]))["is_anomaly"].all()
+    assert not score_frame(bundle, raw, minute=np.array([100, 110]))["is_anomaly"].any()
+
+
+def test_strong_signals_are_still_immediate():
+    # z-score 로 잡히는 급등은 1분짜리라도 바로 이상이다
+    bundle, raw = _bundle_where_iforest_fires_on([False, False, False], z_limit=0.5)  # 가짜 scaler 는 z = 원값 차이
+    raw.loc[1, "error_ratio"] = 0.9
+    assert score_frame(bundle, raw)["is_anomaly"].tolist() == [False, True, False]
+
+
+def test_old_bundle_without_the_flag_keeps_old_behaviour():
+    # champion(이전 모델)을 새 코드로 평가할 때 판정이 바뀌면 비교가 틀어진다
+    bundle, raw = _bundle_where_iforest_fires_on([False, True, False])
+    del bundle["iforest_needs_neighbor"]
+    assert score_frame(bundle, raw)["is_anomaly"].tolist() == [False, True, False]
+
+
+def test_false_alarms_report_sample_size_and_events():
+    y = pd.Series([0, 0, 0, 0, 1, 0])
+    pred = pd.Series([True, True, False, True, True, True])
+    out = steps.false_alarms(y, pred, minute=np.array([1, 2, 3, 4, 5, 20]))
+    assert out["false_alarm_minutes"] == 4
+    assert out["false_alarm_events"] == 3  # 1~2분은 한 건, 4분, 20분 (5분은 장애라 오탐 아님, 20분은 떨어져 있음)
+    assert out["normal_days"] == round(5 / 1440, 2)
+
+
 def test_older_model_with_fewer_features_still_scores():
     """evaluate 단계는 새 코드로 이전 챔피언(v5, 특성 4개)도 점수 낸다 (11-27 v6 학습에서 겪음: X has 5 features)."""
     train, test = steps.split(synthetic(), 0.7)

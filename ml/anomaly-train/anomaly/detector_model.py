@@ -6,6 +6,8 @@
 입력: 1분 단위 행. 열은 RAW_COLUMNS (Prometheus 에서 읽은 값 그대로).
 출력: 행마다 이상 점수(클수록 이상), 이상 여부, 가장 크게 벗어난 특성과 그 z-score, 특성별 z-score(z_<특성>, 부호 있음),
       요청 급감 여부(traffic_drop).
+
+행은 시간 순서의 연속된 분이어야 한다 (v7 부터 IsolationForest 단독 판정은 이웃한 분을 본다).
 """
 
 from __future__ import annotations
@@ -48,7 +50,21 @@ def standardize(scaler, x: pd.DataFrame) -> np.ndarray:
     return np.nan_to_num(scaler.transform(x.to_numpy()), nan=0.0)
 
 
-def score_frame(bundle: dict, raw: pd.DataFrame) -> pd.DataFrame:
+def confirm_with_neighbor(weak: np.ndarray, any_rule: np.ndarray, minute: np.ndarray | None) -> np.ndarray:
+    """약한 판정(weak)은 바로 앞이나 뒤 1분도 이상(any_rule)일 때만 인정한다.
+
+    minute(분 번호)를 주면 실제로 1분 차이인 행만 이웃으로 본다 (평가 데이터는 중간에 빠진 분이 있다).
+    안 주면 행이 연속된 분이라고 본다 (서빙). 마지막 행은 뒤가 없으므로 앞 1분만 본다 = 실시간에서는 1분 늦게 확정된다.
+    """
+    if len(weak) < 2:
+        return np.zeros(len(weak), dtype=bool)
+    adjacent = np.ones(len(weak) - 1, dtype=bool) if minute is None else (np.diff(np.asarray(minute, dtype=float)) == 1)
+    prev = np.r_[False, any_rule[:-1] & adjacent]
+    nxt = np.r_[any_rule[1:] & adjacent, False]
+    return weak & (prev | nxt)
+
+
+def score_frame(bundle: dict, raw: pd.DataFrame, minute: np.ndarray | None = None) -> pd.DataFrame:
     """bundle(scaler, forest, threshold, z_limit, rps_low) 로 점수를 낸다. 학습 평가와 서빙이 같이 쓴다."""
     # 모델마다 학습한 특성 수가 다르다 (v5 까지 4개, v6 부터 mem_growth 포함 5개). 새 코드로 이전 챔피언을
     # 평가할 때(evaluate 단계의 비교) 그 모델이 아는 특성만 넣는다. 특성은 뒤에만 덧붙이므로 앞에서부터 자르면 맞다.
@@ -64,6 +80,13 @@ def score_frame(bundle: dict, raw: pd.DataFrame) -> pd.DataFrame:
     # 그래서 0 으로 떨어져도 z 로는 못 잡는다. 학습 기간의 낮은 쪽(1% 지점)의 절반 아래면 이상으로 본다.
     rps_low = bundle.get("rps_low")  # v5 이전 모델에는 없다
     drop = (feats["rps"].to_numpy() < rps_low) if rps_low is not None else np.zeros(len(feats), dtype=bool)
+    # IsolationForest 단독 판정은 근거가 약하다: 어느 특성도 크게 벗어나지 않았는데 조합이 드물다는 뜻이다.
+    # 11-27 분석에서 정상 구간 오탐이 전부 이 모양(1분짜리 고립, z 1 안팎, 장애 직후)이었다. 이웃한 분도 이상일 때만 인정한다.
+    # z-score·요청 급감은 뚜렷한 신호라 그대로 즉시 판정한다. 이전 모델(키 없음)은 예전처럼 전부 즉시.
+    if bundle.get("iforest_needs_neighbor"):
+        iforest_ok = confirm_with_neighbor(iforest, iforest | zscore | drop, minute)
+    else:
+        iforest_ok = iforest
     top_names = [names[i] for i in top]
     top_names = ["rps" if d and not zz else n for n, d, zz in zip(top_names, drop, zscore)]
     return pd.DataFrame(
@@ -71,7 +94,7 @@ def score_frame(bundle: dict, raw: pd.DataFrame) -> pd.DataFrame:
             "score": score.round(4),
             # 혼합 규칙. IsolationForest 는 학습 기간에 한 번도 변하지 않은 특성(예: 장애 없던 기간의 오류율)으로는
             # 나무를 나누지 못해 그 특성의 급등을 못 본다. 그 빈틈을 특성별 z-score 가 메운다.
-            "is_anomaly": iforest | zscore | drop,
+            "is_anomaly": iforest_ok | zscore | drop,
             "iforest_anomaly": iforest,
             "zscore_anomaly": zscore,
             "traffic_drop": drop,

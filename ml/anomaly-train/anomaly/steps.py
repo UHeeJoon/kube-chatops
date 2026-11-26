@@ -94,7 +94,7 @@ def fit_bundle(train: pd.DataFrame, quantile: float, z_limit: float, seed: int =
     threshold = float(np.quantile(-forest.score_samples(z), quantile))
     rps_low = float(np.quantile(x["rps"].dropna(), RPS_LOW_QUANTILE) * RPS_LOW_FACTOR)
     return {"scaler": scaler, "forest": forest, "threshold": threshold, "z_limit": z_limit, "rps_low": rps_low,
-            "features": list(FEATURES)}
+            "features": list(FEATURES), "iforest_needs_neighbor": True}
 
 
 def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_limit: float) -> str:
@@ -165,13 +165,38 @@ def _bundle_of(model_uri: str) -> dict:
     return mlflow.pyfunc.load_model(model_uri).unwrap_python_model().bundle
 
 
+def minute_numbers(frame: pd.DataFrame) -> np.ndarray | None:
+    """행의 분 번호. 평가 데이터는 애매 구간·학습 구간이 빠져 있어, 이웃한 분인지 판단할 때 쓴다."""
+    if "ts" not in frame:
+        return None
+    return (pd.to_datetime(frame["ts"], utc=True).astype("int64") // 60_000_000_000).to_numpy()
+
+
+def false_alarms(y: pd.Series, pred: pd.Series, minute: np.ndarray | None) -> dict:
+    """정상 구간의 오탐. 분 수와 건수(연속된 분은 한 건), 그리고 표본 크기(정상 며칠치인지)를 같이 낸다.
+
+    하루 환산값만 보면 표본이 작을 때 크게 흔들린다 (v6: 정상 0.4일에서 10분 → "하루 39건").
+    """
+    fp = ((y == 0) & pred.astype(bool)).to_numpy()
+    step = np.r_[np.inf, np.diff(minute)] if minute is not None else np.ones(len(fp))
+    events = int((fp & ~(np.r_[False, fp[:-1]] & (step == 1))).sum())
+    days = float((y == 0).sum()) / 1440
+    return {
+        "false_alarm_minutes": int(fp.sum()),
+        "false_alarm_events": events,
+        "normal_days": round(days, 2),
+        "false_alarms_per_day": round(float(fp.sum()) / max(days, 1e-9), 2),
+    }
+
+
 def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     client = MlflowClient()
     model_id = client.get_run(run_id).data.tags["model_id"]
     test = data.get_frame(test_key)
     y = test["label"]
 
-    scored = score_frame(_bundle_of(f"models:/{model_id}"), test[RAW_COLUMNS])
+    minute = minute_numbers(test)
+    scored = score_frame(_bundle_of(f"models:/{model_id}"), test[RAW_COLUMNS], minute)
     model_m = _metrics(y, scored["is_anomaly"])
     base_m = _metrics(y, scored["zscore_anomaly"])  # 기준선: 특성별 z-score 만
     iforest_m = _metrics(y, scored["iforest_anomaly"])  # 참고: IsolationForest 만
@@ -179,30 +204,36 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     for kind in sorted({k for ks in test["kind"].dropna() for k in str(ks).split(",") if k}):
         mask = test["kind"].astype(str).str.contains(kind)
         by_kind[f"recall_{kind}"] = round(float(scored.loc[mask, "is_anomaly"].mean()), 4)
-    false_alarms_per_day = float(scored.loc[y == 0, "is_anomaly"].sum()) / max((y == 0).sum() / 1440, 1e-9)
+    fa = false_alarms(y, scored["is_anomaly"], minute)
 
     # 지금 champion 이 있으면 같은 평가 데이터로 비교한다 (나빠지는 모델은 올리지 않는다)
     champion_f1 = None
+    champion_fa = None
     try:
         champ = client.get_model_version_by_alias(MODEL_NAME, "champion")
-        champ_scored = score_frame(_bundle_of(f"models:/{MODEL_NAME}@champion"), test[RAW_COLUMNS])
+        champ_scored = score_frame(_bundle_of(f"models:/{MODEL_NAME}@champion"), test[RAW_COLUMNS], minute)
         champion_f1 = _metrics(y, champ_scored["is_anomaly"])["f1"]
-        print(f"champion v{champ.version} f1={champion_f1}")
+        champion_fa = false_alarms(y, champ_scored["is_anomaly"], minute)["false_alarm_minutes"]
+        print(f"champion v{champ.version} f1={champion_f1} false_alarm_minutes={champion_fa}")
     except mlflow.exceptions.MlflowException:
         print("champion 없음 (첫 모델)")
 
-    # 통과 조건: 최소 F1, 기준선보다 크게 나쁘지 않음(0.02 이내), champion 보다 나빠지지 않음(0.01 이내)
+    # 통과 조건: 최소 F1, 기준선보다 크게 나쁘지 않음(0.02 이내), champion 보다 나빠지지 않음(0.01 이내),
+    # 같은 평가 데이터에서 champion 보다 오탐이 늘지 않음 (1분까지는 표본 흔들림으로 봄).
+    # 오탐이 늘어난 모델은 F1 이 좋아도 올리지 않는다 (11-27 결정: v6 는 F1 0.917 인데 오탐 때문에 승격 보류).
     passed = (
         model_m["f1"] >= min_f1
         and model_m["f1"] >= base_m["f1"] - 0.02
         and (champion_f1 is None or model_m["f1"] >= champion_f1 - 0.01)
+        and (champion_fa is None or fa["false_alarm_minutes"] <= champion_fa + 1)
     )
     result = {
         "model": model_m,
         "baseline_zscore": base_m,
         "iforest_only": iforest_m,
         "champion_f1": champion_f1,
-        "false_alarms_per_day": round(false_alarms_per_day, 2),
+        **fa,
+        "champion_false_alarm_minutes": champion_fa,
         **by_kind,
         "passed": passed,
     }
@@ -210,7 +241,9 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
         mlflow.log_metrics({f"test_{k}": v for k, v in model_m.items()})
         mlflow.log_metrics({f"baseline_{k}": v for k, v in base_m.items()})
         mlflow.log_metrics({f"iforest_{k}": v for k, v in iforest_m.items()})
-        mlflow.log_metrics({"false_alarms_per_day": result["false_alarms_per_day"], **by_kind})
+        mlflow.log_metrics({**fa, **by_kind})
+        if champion_fa is not None:
+            mlflow.log_metric("champion_false_alarm_minutes", champion_fa)
         if champion_f1 is not None:
             mlflow.log_metric("champion_f1", champion_f1)
         mlflow.set_tag("evaluation", "passed" if passed else "failed")
@@ -268,6 +301,10 @@ def summary(workflow: str) -> dict:
             "baseline_f1": m.get("baseline_f1"),
             "iforest_f1": m.get("iforest_f1"),
             "false_alarms_per_day": m.get("false_alarms_per_day"),
+            "false_alarm_minutes": m.get("false_alarm_minutes"),
+            "false_alarm_events": m.get("false_alarm_events"),
+            "normal_days": m.get("normal_days"),
+            "champion_false_alarm_minutes": m.get("champion_false_alarm_minutes"),
             "recall_by_kind": {k.removeprefix("recall_"): v for k, v in m.items() if k.startswith("recall_")},
             "data": {k: p.get(k) for k in ("data_start", "data_end", "train_rows", "test_rows", "test_anomaly_rows")},
         }
