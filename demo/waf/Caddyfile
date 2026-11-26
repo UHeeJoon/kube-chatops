@@ -11,16 +11,19 @@
 		trusted_proxies static private_ranges
 		client_ip_headers CF-Connecting-IP X-Forwarded-For
 		trusted_proxies_strict
-		metrics
 	}
+	metrics
 	log {
 		output stdout
 		format json
+		# Coraza 가 Caddy 로거로 남기는 줄(규칙마다 한 줄, 평소 요청에도 "key not found in collection" 경고)은 버린다.
+		# 11-27 실측 평소 트래픽만으로 5분 2,200줄. 차단 기록은 아래 감사 로그(요청 하나 = JSON 한 줄)로 충분하다.
+		exclude http.handlers.waf
 	}
 }
 
 :8080 {
-	# 접근 로그는 남기지 않는다 (평소 초당 5건 → 하루 43만 줄). 차단한 요청만 WAF 로그(실제 IP, 규칙 id)와 감사 로그(JSON)로 남는다
+	# 접근 로그는 남기지 않는다 (평소 초당 5건 → 하루 43만 줄). 차단한 요청만 감사 로그(실제 IP, 요청, 걸린 규칙)로 남는다
 	# 운영용 경로는 게이트웨이 쪽에 내놓지 않는다 (장애 주입은 n8n·스크립트가 demo-app 에 직접 한다)
 	@ops path /chaos/* /metrics /healthz* /readyz
 	respond @ops 404
@@ -33,6 +36,7 @@
 			Include @owasp_crs/*.conf
 			SecRuleEngine On
 			SecResponseBodyAccess Off
+			# 감사 로그 = 막은(403) 요청 하나당 JSON 한 줄 → Loki → mcp-loki waf_blocks 도구가 읽는다
 			SecAuditEngine RelevantOnly
 			SecAuditLogRelevantStatus "^403$"
 			SecAuditLogParts ABHZ
