@@ -50,8 +50,11 @@ def standardize(scaler, x: pd.DataFrame) -> np.ndarray:
 
 def score_frame(bundle: dict, raw: pd.DataFrame) -> pd.DataFrame:
     """bundle(scaler, forest, threshold, z_limit, rps_low) 로 점수를 낸다. 학습 평가와 서빙이 같이 쓴다."""
+    # 모델마다 학습한 특성 수가 다르다 (v5 까지 4개, v6 부터 mem_growth 포함 5개). 새 코드로 이전 챔피언을
+    # 평가할 때(evaluate 단계의 비교) 그 모델이 아는 특성만 넣는다. 특성은 뒤에만 덧붙이므로 앞에서부터 자르면 맞다.
+    names = bundle.get("features") or FEATURES[: bundle["scaler"].n_features_in_]
     feats = to_features(raw)
-    z = standardize(bundle["scaler"], feats)
+    z = standardize(bundle["scaler"], feats[names])
     score = -bundle["forest"].score_samples(z)  # IsolationForest: 낮을수록 이상 → 부호를 뒤집는다
     abs_z = np.abs(z)
     top = abs_z.argmax(axis=1)
@@ -61,7 +64,7 @@ def score_frame(bundle: dict, raw: pd.DataFrame) -> pd.DataFrame:
     # 그래서 0 으로 떨어져도 z 로는 못 잡는다. 학습 기간의 낮은 쪽(1% 지점)의 절반 아래면 이상으로 본다.
     rps_low = bundle.get("rps_low")  # v5 이전 모델에는 없다
     drop = (feats["rps"].to_numpy() < rps_low) if rps_low is not None else np.zeros(len(feats), dtype=bool)
-    top_names = [FEATURES[i] for i in top]
+    top_names = [names[i] for i in top]
     top_names = ["rps" if d and not zz else n for n, d, zz in zip(top_names, drop, zscore)]
     return pd.DataFrame(
         {
@@ -75,7 +78,7 @@ def score_frame(bundle: dict, raw: pd.DataFrame) -> pd.DataFrame:
             "top_feature": top_names,
             "top_z": abs_z.max(axis=1).round(2),
             # 특성별 z (부호: + 평소보다 큼, - 작음). 대시보드에서 "왜 이상인지" 를 보여 주는 데 쓴다
-            **{f"z_{f}": z[:, i].round(2) for i, f in enumerate(FEATURES)},
+            **{f"z_{f}": z[:, i].round(2) for i, f in enumerate(names)},
         },
         index=raw.index,
     )

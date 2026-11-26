@@ -93,7 +93,8 @@ def fit_bundle(train: pd.DataFrame, quantile: float, z_limit: float, seed: int =
     forest = IsolationForest(n_estimators=200, random_state=seed).fit(z)
     threshold = float(np.quantile(-forest.score_samples(z), quantile))
     rps_low = float(np.quantile(x["rps"].dropna(), RPS_LOW_QUANTILE) * RPS_LOW_FACTOR)
-    return {"scaler": scaler, "forest": forest, "threshold": threshold, "z_limit": z_limit, "rps_low": rps_low}
+    return {"scaler": scaler, "forest": forest, "threshold": threshold, "z_limit": z_limit, "rps_low": rps_low,
+            "features": list(FEATURES)}
 
 
 def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_limit: float) -> str:

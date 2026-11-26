@@ -2,9 +2,11 @@
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
 from anomaly import steps
-from anomaly.detector_model import RAW_COLUMNS, score_frame
+from anomaly.detector_model import FEATURES, RAW_COLUMNS, score_frame, to_features
 
 
 def synthetic(minutes: int = 600, seed: int = 0) -> pd.DataFrame:
@@ -125,3 +127,15 @@ def test_traffic_drop_detected_although_z_lower_bound_is_negative():
     assert out["traffic_drop"] and out["is_anomaly"] and out["top_feature"] == "rps"
     raw.loc[0, "rps"] = 3.0  # 평소 낮은 시간대는 정상
     assert not score_frame(bundle, raw)["is_anomaly"].iloc[0]
+
+
+def test_older_model_with_fewer_features_still_scores():
+    """evaluate 단계는 새 코드로 이전 챔피언(v5, 특성 4개)도 점수 낸다 (11-27 v6 학습에서 겪음: X has 5 features)."""
+    train, test = steps.split(synthetic(), 0.7)
+    four = to_features(train[RAW_COLUMNS])[FEATURES[:4]]
+    scaler = StandardScaler().fit(four)
+    v5 = {**steps.fit_bundle(train, quantile=0.999, z_limit=4.0), "scaler": scaler,
+          "forest": IsolationForest(random_state=0).fit(scaler.transform(four))}
+    del v5["features"]  # v5 번들에는 특성 목록이 없다
+    out = score_frame(v5, test[RAW_COLUMNS])
+    assert len(out) == len(test) and "z_mem_growth" not in out.columns
