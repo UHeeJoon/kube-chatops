@@ -41,7 +41,13 @@
 			SecAuditLog /dev/stdout
 		`
 	}
-	reverse_proxy {$UPSTREAM:demo-app.demo.svc:8080}
+	reverse_proxy {$UPSTREAM:demo-app.demo.svc:8080} {
+		# Cilium 은 연결 단위로 백엔드 파드를 고른다. 연결을 재사용하면 요청이 한 파드에 몰려
+		# (11-27 실측 4.6 대 0.6 rps) 파드별 지표(메모리 누수 등)가 왜곡된다. 요청마다 새 연결.
+		transport http {
+			keepalive off
+		}
+	}
 }
 
 # Prometheus 수집용 (요청 수·응답 코드). 게이트웨이에는 내놓지 않는다
