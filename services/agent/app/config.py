@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     mcp_token_loki: SecretStr | None = None
     mcp_token_k8s: SecretStr | None = None
     mcp_token_anomaly: SecretStr | None = None
+    mcp_token_runbook: SecretStr | None = None
+    # 사건 보고를 런북 검색 서버(mcp-runbook)에 넣는 주소. 비어 있으면 넣지 않는다 (similar_incidents 의 원본)
+    runbook_ingest_url: str = ""
     max_tool_result_chars: int = 12000
 
     # Postgres (aiops-pg 의 agent DB): 체크포인터와 예산 장부

@@ -13,7 +13,9 @@ RUN MODEL_DIR=/models ./target/release/mcp-runbook download-model
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /src/target/release/mcp-runbook /usr/local/bin/mcp-runbook
 COPY --from=build --chown=65532:65532 /models /models
-ENV MODEL_DIR=/models HF_HUB_OFFLINE=1
+# 런북은 이미지에 넣는다. 고치면 CI 가 다시 빌드·서명·배포하고, 서버가 뜰 때 바뀐 것만 다시 수집한다
+COPY runbooks /runbooks
+ENV MODEL_DIR=/models RUNBOOK_DIR=/runbooks HF_HUB_OFFLINE=1
 USER 65532:65532
 EXPOSE 8080 9090
 ENTRYPOINT ["/usr/local/bin/mcp-runbook"]

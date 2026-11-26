@@ -21,6 +21,7 @@ from .telemetry import setup_tracing
 
 _provider = setup_tracing()  # graph/toolbox 가 tracer 를 잡기 전에 전역 프로바이더를 등록
 
+import httpx2  # noqa: E402
 from fastapi import Depends, FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # noqa: E402
@@ -33,7 +34,7 @@ from pydantic import BaseModel, Field  # noqa: E402
 from . import graph as g  # noqa: E402
 from .budget import Ledger, Usage  # noqa: E402
 from .config import settings  # noqa: E402
-from .incidents import Incidents, snapshot, to_markdown, tool_trace  # noqa: E402
+from .incidents import Incidents, search_document, snapshot, to_markdown, tool_trace  # noqa: E402
 from .toolbox import Toolbox  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}')
@@ -141,8 +142,9 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
                         incident = await state.incidents.record(
                             thread_id=body.thread_id, question=body.question, alert=body.alert, report=out.get("report"),
                             trace=tool_trace(out.get("messages") or [], out.get("tool_calls", 0) + 1),
-                            timeline=await snapshot(toolbox, body.alert), stopped_by=stopped,
+                            timeline=(timeline := await snapshot(toolbox, body.alert)), stopped_by=stopped,
                             tool_calls=out.get("tool_calls", 0), cost_usd=usage.cost_usd)
+                        await _index_incident(incident, body, out.get("report"), timeline)
                     except Exception:  # noqa: BLE001
                         log.exception("사건 기록 실패 thread=%s", body.thread_id)
     STOPS.labels(stopped).inc()
@@ -150,6 +152,21 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
     log.info("investigate thread=%s stopped_by=%s tools=%s cost=%.4f", body.thread_id, stopped, out.get("tool_calls"), usage.cost_usd)
     return {"thread_id": body.thread_id, "mode": body.mode, "answer": out.get("answer"), "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage),
             "incident": incident}
+
+
+async def _index_incident(incident: dict[str, Any], body: InvestigateIn, report: dict[str, Any] | None, timeline: dict[str, Any]) -> None:
+    """사건 보고를 런북 검색 서버에 넣는다 (다음 조사의 similar_incidents 가 찾을 수 있게). 실패해도 조사 결과에는 영향이 없다."""
+    token = settings.mcp_token_runbook
+    if not settings.runbook_ingest_url or token is None:
+        return
+    labels = ((body.alert or {}).get("alerts") or [{}])[0].get("labels") or {}
+    doc = search_document(incident["incident_id"], incident["report_no"], labels.get("alertname"), labels.get("namespace") or "-", report, body.question, timeline)
+    try:
+        async with httpx2.AsyncClient(timeout=20) as client:
+            r = await client.post(settings.runbook_ingest_url, json=doc, headers={"Authorization": f"Bearer {token.get_secret_value()}"})
+            r.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        log.warning("사건 색인 실패 incident=%s: %s: %s", incident["incident_id"], type(e).__name__, e)
 
 
 @app.get("/incidents", dependencies=[Depends(require_token)])

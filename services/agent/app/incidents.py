@@ -185,6 +185,30 @@ class Incidents:
         return {**_plain(inc), "reports": reports}
 
 
+def search_document(incident_id: int, report_no: int, alertname: str | None, namespace: str, report: dict[str, Any] | None, question: str,
+                    timeline: dict[str, Any]) -> dict[str, Any]:
+    """런북 검색 서버에 넣을 사건 보고 한 건 (마크다운). 나중에 similar_incidents 가 이 글을 찾는다."""
+    rep = report or {}
+    headline = rep.get("headline") or question[:200]
+    lines = [f"# 사건 #{incident_id}: {headline}", "", f"알림 {alertname or '없음 (Slack 질문)'} · 대상 {namespace} · {_kst(datetime.now(timezone.utc).isoformat())} (KST)"]
+    if rep.get("impact"):
+        lines += ["", "## 영향", ""] + [f"- {x}" for x in rep["impact"]]
+    if rep.get("causes"):
+        lines += ["", "## 원인", ""]
+        for c in rep["causes"]:
+            lines += [f"- {c.get('title')} ({round((c.get('confidence') or 0) * 100)}%)"] + [f"  - {e}" for e in c.get("evidence") or []]
+    acts = [a for a in rep.get("actions") or [] if a.get("type") != "none"]
+    if acts:
+        lines += ["", "## 조치 제안", ""] + [f"- {a['type']} {a['target']}: {a['reason']}" for a in acts]
+    blocked = timeline.get("blocked_requests")
+    ips = [ip.get("client_ip") for ip in (blocked.get("by_ip") or blocked.get("ips") or [])] if isinstance(blocked, dict) else []
+    if ips:
+        lines += ["", "## 출발 IP", "", ", ".join(map(str, ips[:10]))]
+    return {"kind": "incident", "source": f"incident/{incident_id}/report/{report_no}", "title": f"사건 #{incident_id}: {headline}",
+            "content": "\n".join(lines),
+            "meta": {"incident_id": incident_id, "report_no": report_no, "alertname": alertname, "namespace": namespace, "severity": rep.get("status")}}
+
+
 def _plain(row: dict[str, Any]) -> dict[str, Any]:
     out = {}
     for k, v in row.items():
