@@ -360,7 +360,10 @@ return [{ json: { channel: req.channel_id, ts: $('조사 중 표시').item.json.
   audit: { flow: 'wf-02-investigate', result, source: req.source, user_id: req.user_id, role: req.role,
     channel_id: req.channel_id, thread_id: req.thread_id, seconds: secs, agent_status: res.statusCode,
     mode: req.mode, cost_usd: cost, tool_calls: res.body?.tool_calls ?? 0, stopped_by: res.body?.stopped_by ?? null,
-    quarantine: req.quarantine ? `${req.quarantine.pod}:${req.quarantine.done ? 'done' : 'failed'}` : null } } }];
+    quarantine: req.quarantine ? `${req.quarantine.pod}:${req.quarantine.done ? 'done' : 'failed'}` : null,
+    // 어떤 알림의 조사였는지 (공격 재현 평가 scripts/attack-replay.py 가 보고를 공격과 짝짓는 데 쓴다)
+    alert: req.alert?.alerts?.[0]?.labels?.alertname ?? null,
+    alert_pod: req.alert?.alerts?.[0]?.labels?.pod ?? req.alert?.alerts?.[0]?.labels?.source_workload ?? null } } }];
 """
 AUDIT_INV = """
 return [{ json: { ...$('보고서 만들기').item.json.audit, slack_status: $json.statusCode, execution_id: $execution.id } }];
