@@ -136,18 +136,22 @@ async def error_summary(namespace: str = "demo", minutes: int = 30) -> str:
 
 
 def _exec_target(ev: dict) -> str:
+    """이벤트가 겨냥한 것: 실행하려던 파일(exec), 쓰려던 파일(file_permission), 권한을 바꾸려던 파일(chmod)."""
     for a in ev.get("args") or []:
-        if "linux_binprm_arg" in a:
-            return a["linux_binprm_arg"].get("path", "")
+        for key in ("linux_binprm_arg", "file_arg", "path_arg"):
+            if key in a:
+                return a[key].get("path", "")
     return ""
 
 
 @server.tool()
 @instrumented
 async def security_events(minutes: int = 60, pod: str | None = None, limit: int = 20) -> str:
-    """Tetragon(eBPF) 이 커널에서 잡은 demo 파드의 보안 이벤트를 돌려준다. 웹셸 차단 알림을 조사할 때 먼저 쓴다.
+    """Tetragon(eBPF) 이 커널에서 잡은 demo 파드의 보안 이벤트를 돌려준다. 웹셸·파일 변조·침해 차단 알림을 조사할 때 먼저 쓴다.
 
-    이벤트 하나 = 웹 서버 프로세스(parent)가 셸·다운로더(target)를 실행하려 한 순간. action=SIGKILL 이면 실행 전에 죽였다(차단).
+    policy 별 뜻: webshell-block=웹 서버가 프로그램 실행 시도, webroot-tamper-block=웹 서버가 웹 루트·시스템 경로에 쓰기 시도,
+    dropper-block=임시 경로·웹 루트의 파일 실행, privesc-block=su·sudo 등 실행 또는 setuid 비트 설정.
+    target=실행·쓰기·권한 변경하려던 파일, hook=커널 함수. action: SIGKILL=프로세스 종료, OVERRIDE=그 호출만 실패(EPERM), POST=기록만.
     - pod: 이 파드만 (생략하면 demo 전체)
     - minutes: 최근 몇 분 (최대 120), limit: 돌려줄 최근 이벤트 수 (최대 50)
     결과: 파드별 요약(시도 횟수, 처음·마지막 시각, 시도한 실행 파일, 조치) + 최근 시도. 시각은 UTC.
@@ -194,6 +198,7 @@ async def security_events(minutes: int = 60, pod: str | None = None, limit: int 
                 "action": action,
                 "parent": f"{parent.get('binary', '')} {parent.get('arguments', '')}".strip()[:200],
                 "process": f"{proc.get('binary', '')} {proc.get('arguments', '')}".strip()[:200],
+                "hook": ev.get("function_name"),
                 "target": _exec_target(ev),
                 "uid": proc.get("uid"),
             }
