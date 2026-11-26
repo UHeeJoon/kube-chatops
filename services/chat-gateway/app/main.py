@@ -139,6 +139,8 @@ async def on_action(ack, body, client):
         "channel_id": channel,
         "thread_id": msg.get("thread_ts") or msg.get("ts"),
         "message_ts": msg.get("ts"),
+        # 버튼이 달린 글의 내용. n8n 이 버튼을 누른 뒤 그 글을 고칠 때(승격 진행·완료 표시) 원래 블록이 필요하다
+        "message": {"text": msg.get("text"), "blocks": msg.get("blocks")},
         "action": {"id": action.get("action_id"), "value": action.get("value")},
     }
     if not await _forward(payload) and channel:

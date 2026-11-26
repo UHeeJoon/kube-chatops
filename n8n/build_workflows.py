@@ -525,6 +525,45 @@ const text = req.op === 'deny' ? `:no_entry: 재학습과 승격은 operator 만
 return [{ json: { channel: req.channel_id, thread_ts: req.thread_id, text, audit: { flow: 'wf-04-mlops', result: req.op, user_id: req.user_id, role: req.role } } }];
 """
 
+# 승격 버튼이 달린 글(학습 결과 카드, 상태 카드)을 고친다: 누른 버전의 버튼을 상태 한 줄로 바꾼다.
+#   진행 중 → 버튼 없음 / 완료 → "v8 로 되돌리기" 버튼 (나중에 다른 버전으로 옮긴 뒤 돌아올 때) / 실패 → 원래 버튼 그대로.
+# 글의 원래 블록은 chat-gateway 가 버튼 이벤트에 실어 준다 (없으면 ts 가 비어 gateway 가 거절하고 흐름은 계속된다).
+CARD_EDIT = r"""
+function cardEdit(p, status, button) {
+  const kst = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+  const src = (p.message?.blocks ?? []).filter(b => b.block_id !== `promote_status_${p.version}`);
+  const out = [];
+  for (const b of src) {
+    if (b.type !== 'actions' || !(b.elements ?? []).some(e => e.action_id === 'mlops_promote' && String(e.value) === String(p.version))) { out.push(b); continue; }
+    out.push({ type: 'context', block_id: `promote_status_${p.version}`, elements: [{ type: 'mrkdwn', text: `${status} · ${kst}` }] });
+    const elements = b.elements.map(e => {
+      if (e.action_id !== 'mlops_promote' || String(e.value) !== String(p.version)) return e;
+      if (button === 'keep') return e;
+      if (button === 'rollback') return { type: 'button', action_id: 'mlops_promote', value: String(p.version),
+        text: { type: 'plain_text', text: `v${p.version} 로 되돌리기` },
+        confirm: { title: { type: 'plain_text', text: `v${p.version} 로 되돌리기` }, confirm: { type: 'plain_text', text: '전환' }, deny: { type: 'plain_text', text: '취소' },
+          text: { type: 'mrkdwn', text: `서빙 모델을 v${p.version} 로 바꾸는 커밋을 올립니다. 이미 v${p.version} 가 서빙 중이면 아무 일도 하지 않습니다.` } } };
+      return null;
+    }).filter(Boolean);
+    if (elements.length) out.push({ ...b, elements });
+  }
+  return { channel: p.channel_id, ts: src.length ? (p.message_ts ?? null) : null, text: p.message?.text || `demo-anomaly v${p.version}`, blocks: out };
+}
+"""
+CARD_PROGRESS = CARD_EDIT + """
+const p = $('커밋 완료').item.json;
+return [{ json: { card: cardEdit(p, `:rocket: *v${p.version} 승격 진행 중* · <@${p.user_id}> 승인`, 'none') } }];
+"""
+CARD_DONE = CARD_EDIT + """
+const p = $('반영 확인').item.json;
+return [{ json: { card: cardEdit(p, `:white_check_mark: *v${p.version} 서빙 시작* · <@${p.user_id}> 승격`, 'rollback') } }];
+"""
+CARD_TIMEOUT = CARD_EDIT + """
+const p = $('반영 확인').item.json;
+return [{ json: { card: cardEdit(p, `:warning: *v${p.version} 승격이 15분 안에 반영되지 않음* (스레드 참고) · <@${p.user_id}>`, 'keep') } }];
+"""
+CARD_BODY = "={{ JSON.stringify($json.card) }}"
+
 PROMOTE_PREP = """
 // 승격할 버전의 모델 위치(storage_uri 태그)와 model id. 이미 champion 이면 멈춘다.
 const req = $('요청 정리').item.json;
@@ -614,6 +653,12 @@ mlops = workflow(W, "WF-04 mlops (재학습과 승격)", [
     http(W, "커밋", (2200, 600), "PUT", GITHUB_FILE, "={{ JSON.stringify($json.put) }}", "github", headers=GH),
     code(W, "커밋 완료", (2420, 600), COMMITTED),
     http(W, "커밋 알림", (2640, 600), "POST", f"{GATEWAY}/slack/post", POST_SLACK, "gateway"),
+    code(W, "카드: 진행 중", (2640, 780), CARD_PROGRESS),
+    http(W, "카드 고치기 (진행)", (2860, 780), "POST", f"{GATEWAY}/slack/update", CARD_BODY, "gateway"),
+    code(W, "카드: 완료", (3960, 380), CARD_DONE),
+    http(W, "카드 고치기 (완료)", (4180, 380), "POST", f"{GATEWAY}/slack/update", CARD_BODY, "gateway"),
+    code(W, "카드: 시간 초과", (3960, 880), CARD_TIMEOUT),
+    http(W, "카드 고치기 (시간 초과)", (4180, 880), "POST", f"{GATEWAY}/slack/update", CARD_BODY, "gateway"),
     node(W, "1분 대기", "n8n-nodes-base.wait", 1.1, (2860, 600), {"amount": 60, "unit": "seconds"}, webhookId=nid(W, "wait/hook")),
     http(W, "서빙 모델 확인", (3080, 600), "POST", MODEL_PREDICT,
          "={{ JSON.stringify({ instances: [{ rps: 1, error_ratio: 0, p95_seconds: 0.01, mem_ratio: 0.1 }] }) }}", None, timeout_ms=10000),
@@ -639,7 +684,9 @@ mlops = workflow(W, "WF-04 mlops (재학습과 승격)", [
     ("버전 조회", "승격 준비"), ("승격 준비", "이미 champion?"),
     ("이미 champion?", "이미 서빙 중", 0), ("이미 champion?", "파일 읽기", 1), ("이미 서빙 중", "Slack 글 정리"),
     ("파일 읽기", "파일 고치기"), ("파일 고치기", "커밋"), ("커밋", "커밋 완료"), ("커밋 완료", "커밋 알림"),
-    ("커밋 알림", "1분 대기"), ("1분 대기", "서빙 모델 확인"), ("서빙 모델 확인", "반영 확인"), ("반영 확인", "반영됨?"),
+    ("커밋 알림", "1분 대기"), ("커밋 완료", "카드: 진행 중"), ("카드: 진행 중", "카드 고치기 (진행)"),
+    ("champion 지정", "카드: 완료"), ("카드: 완료", "카드 고치기 (완료)"),
+    ("포기?", "카드: 시간 초과", 0), ("카드: 시간 초과", "카드 고치기 (시간 초과)"), ("1분 대기", "서빙 모델 확인"), ("서빙 모델 확인", "반영 확인"), ("반영 확인", "반영됨?"),
     ("반영됨?", "champion 지정", 0), ("반영됨?", "포기?", 1),
     ("champion 지정", "완료 답장"), ("완료 답장", "Slack 글 정리"),
     ("포기?", "시간 초과", 0), ("포기?", "1분 대기", 1), ("시간 초과", "Slack 글 정리"),
