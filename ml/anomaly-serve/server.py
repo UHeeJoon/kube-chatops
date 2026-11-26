@@ -31,11 +31,17 @@ class AnomalyModel(Model):
         self.model_dir = model_dir
         self.model = None
         self.model_version = "unknown"
+        self.columns = list(REQUIRED)
 
     def load(self) -> bool:
         self.model = mlflow.pyfunc.load_model(self.model_dir)
         self.model_version = self.model.metadata.model_id or self.model.metadata.run_id or "unknown"
-        log.info("모델 로드 완료: %s (%s)", self.name, self.model_version)
+        # 모델마다 입력 열이 다르다 (v5 까지 4개, v6 부터 mem_growth 포함 5개). 모델의 입력 스키마를 따른다.
+        # 11-27: 열을 4개로 고정해 두어 v8 승격 직후 모든 예측이 500 이었다 ("Model is missing inputs ['mem_growth']").
+        schema = self.model.metadata.get_input_schema()
+        names = [str(n) for n in schema.input_names()] if schema is not None else []
+        self.columns = REQUIRED + [c for c in names if c not in REQUIRED]
+        log.info("모델 로드 완료: %s (%s), 입력 열 %s", self.name, self.model_version, self.columns)
         self.ready = True
         return self.ready
 
@@ -52,7 +58,8 @@ class AnomalyModel(Model):
         if missing:
             raise ValueError(f"빠진 열: {missing}")
         # 모델 입력 스키마는 float. 정수(5)나 null 이 와도 받도록 숫자로 바꾼다 (null → NaN → 모델이 0 으로 채움)
-        x = df[REQUIRED].apply(pd.to_numeric, errors="coerce").astype("float64")
+        # 필수 4개 외의 열(mem_growth 등)은 요청에 없으면 NaN 으로 둔다 (모델이 평소 값으로 본다)
+        x = df.reindex(columns=self.columns).apply(pd.to_numeric, errors="coerce").astype("float64")
         out = self.model.predict(x)
         # numpy bool/float 을 JSON 기본 타입으로
         return {"predictions": json.loads(out.to_json(orient="records")), "model_version": self.model_version}
