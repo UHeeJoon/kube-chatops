@@ -152,6 +152,8 @@ if (role === 'none') {{
 }} else if (ev.type === 'button_click') {{
   mode = 'reply';
   reply = '승인 버튼 처리는 아직 준비 중입니다.';
+}} else if (/^(사건|보고서|incidents?)\\s*(목록|list|#?\\d+)?$/i.test((ev.text ?? '').trim())) {{
+  mode = 'incident';  // 사건 기록 조회 (agent DB, LLM 을 부르지 않는다)
 }} else if (!(ev.text ?? '').trim()) {{
   mode = 'reply';
   reply = '무엇을 도와드릴까요? 예: "주문 조회가 느려졌어요, 원인 확인해줘"';
@@ -182,6 +184,27 @@ return [{ json: { flow: 'wf-01-intake', result: $('답장 정리').item.json.res
   role: $('답장 정리').item.json.role, channel_id: $('답장 정리').item.json.channel_id, thread_id: $('답장 정리').item.json.thread_id,
   intent: $('답장 정리').item.json.intent ?? null, slack_status: $json.statusCode, execution_id: $execution.id } }];
 """
+INCIDENT_URL = """={{ (() => { const m = String($json.text ?? '').match(/\\d+/); return 'AGENT_BASE/incidents' + (m ? '/' + m[0] : '?limit=10'); })() }}"""
+INCIDENT_REPLY = """
+// 사건 목록 또는 사건 하나(마크다운)를 Slack 글로
+const ev = $('준비').item.json;
+const res = $json;
+const kst = t => new Date(t).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+const toSlack = t => String(t ?? '').replace(/\\*\\*(.+?)\\*\\*/g, '*$1*').replace(/^#{1,6}\\s*(.+)$/gm, '*$1*').replace(/^\\s*- /gm, '• ');
+let reply;
+if (res.statusCode === 404) reply = '그 번호의 사건이 없습니다. `사건 목록` 으로 번호를 확인하세요.';
+else if (res.statusCode !== 200) reply = `사건 기록을 읽지 못했습니다 (agent ${res.statusCode ?? '연결 실패'}).`;
+else if (res.body.markdown) {
+  const md = toSlack(res.body.markdown);
+  reply = md.length > 3800 ? md.slice(0, 3800) + '\\n…(길어서 줄임)' : md;
+} else {
+  const sev = { critical: ':red_circle:', warning: ':large_yellow_circle:', ok: ':large_green_circle:' };
+  const rows = (res.body.incidents ?? []).map(i =>
+    `${sev[i.severity] ?? ':white_circle:'} *#${i.id}* ${kst(i.opened_at)} · \\`${i.namespace}\\` · ${String(i.title).slice(0, 80)}\\n      ◦ ${(i.alert_names ?? []).join(', ') || 'Slack 질문'} · 조사 ${i.report_count}회 · $${Number(i.cost_usd).toFixed(2)}`);
+  reply = rows.length ? `*최근 사건* (자세히: \\`사건 번호\\`)\\n${rows.join('\\n')}` : '기록된 사건이 없습니다.';
+}
+return [{ json: { ...ev, reply, intent: 'incident' } }];
+"""
 REPLY_PREP = """
 // 두 갈래(권한/형식 답장, /route 답장)에서 온 항목을 같은 모양으로
 const it = $json;
@@ -192,6 +215,9 @@ intake = workflow(W, "WF-01 intake (Slack 이벤트)", [
     webhook(W, "Slack 이벤트", (0, 300), "chat", "hook_chat"),
     code(W, "준비", (220, 300), PREPARE),
     if_true(W, "분류 필요?", (440, 300), "={{ $json.mode === 'route' }}"),
+    if_true(W, "사건 조회?", (660, 800), "={{ $json.mode === 'incident' }}"),
+    http(W, "사건 기록", (880, 800), "GET", INCIDENT_URL.replace("AGENT_BASE", AGENT), None, "agent"),
+    code(W, "사건 답장", (1100, 800), INCIDENT_REPLY),
     if_true(W, "보안 조치?", (660, 550), "={{ $json.mode === 'security' }}"),
     node(W, "조치 (WF-03)", "n8n-nodes-base.executeWorkflow", 1.2, (880, 450),
          {"workflowId": {"__rl": True, "value": WF["actions"], "mode": "id"}, "options": {"waitForSubWorkflow": False}}),
@@ -210,7 +236,8 @@ intake = workflow(W, "WF-01 intake (Slack 이벤트)", [
     call_audit(W, "감사 (WF-99)", (1980, 400)),
 ], links(
     ("Slack 이벤트", "준비"), ("준비", "분류 필요?"),
-    ("분류 필요?", "의도 분류", 0), ("분류 필요?", "보안 조치?", 1),
+    ("분류 필요?", "의도 분류", 0), ("분류 필요?", "사건 조회?", 1),
+    ("사건 조회?", "사건 기록", 0), ("사건 조회?", "보안 조치?", 1), ("사건 기록", "사건 답장"), ("사건 답장", "답장 정리"),
     ("보안 조치?", "조치 (WF-03)", 0), ("보안 조치?", "MLOps?", 1),
     ("의도 분류", "다음 단계"), ("다음 단계", "조사?"),
     ("조사?", "조사 시작 (WF-02)", 0), ("조사?", "MLOps?", 1),
@@ -312,7 +339,8 @@ const cost = (u0.cost_usd ?? 0) + (req.route_cost ?? 0);  // 의도 분류 비�
 const llm = (u0.llm_calls ?? 0) + (req.route_cost ? 1 : 0);
 const stopped = res.body?.stopped_by && res.body.stopped_by !== 'done' ? ` · 한도 도달로 중단(${res.body.stopped_by})` : '';
 const foot = { type: 'context', elements: [{ type: 'mrkdwn',
-  text: `도구 ${res.body?.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초${stopped}` }] };
+  text: `도구 ${res.body?.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초${stopped}` +
+    (res.body?.incident ? ` · 사건 #${res.body.incident.incident_id} 의 ${res.body.incident.report_no}번째 보고 (\`@봇 사건 ${res.body.incident.incident_id}\` 로 전체 보기)` : '') }] };
 const sec = t => ({ type: 'section', text: { type: 'mrkdwn', text: clip(t, 2900) } });
 let blocks = [], text, result;
 if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질문 답, 또는 보고서 없이 글로 끝난 조사
@@ -362,6 +390,7 @@ return [{ json: { channel: req.channel_id, ts: $('조사 중 표시').item.json.
     mode: req.mode, cost_usd: cost, tool_calls: res.body?.tool_calls ?? 0, stopped_by: res.body?.stopped_by ?? null,
     quarantine: req.quarantine ? `${req.quarantine.pod}:${req.quarantine.done ? 'done' : 'failed'}` : null,
     // 어떤 알림의 조사였는지 (공격 재현 평가 scripts/attack-replay.py 가 보고를 공격과 짝짓는 데 쓴다)
+    incident_id: res.body?.incident?.incident_id ?? null,
     alert: req.alert?.alerts?.[0]?.labels?.alertname ?? null,
     alert_pod: req.alert?.alerts?.[0]?.labels?.pod ?? req.alert?.alerts?.[0]?.labels?.source_workload ?? null } } }];
 """

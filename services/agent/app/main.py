@@ -2,6 +2,8 @@
 
 POST /route        {text}                               → {intent, target, reply, usage}
 POST /investigate  {thread_id, question, alert?}        → {thread_id, report, usage, stopped_by}
+GET  /incidents    ?limit=                              → 최근 사건 목록 (조사 보고서를 사건 단위로 묶은 기록)
+GET  /incidents/{id}                                    → 사건 하나 (보고 전부 + 마크다운)
 GET  /healthz      인증 없음
 메트릭은 별도 포트 :9090/metrics (prometheus_client).
 """
@@ -31,6 +33,7 @@ from pydantic import BaseModel, Field  # noqa: E402
 from . import graph as g  # noqa: E402
 from .budget import Ledger, Usage  # noqa: E402
 from .config import settings  # noqa: E402
+from .incidents import Incidents, snapshot, to_markdown, tool_trace  # noqa: E402
 from .toolbox import Toolbox  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}')
@@ -69,7 +72,9 @@ async def lifespan(app: FastAPI):
     await saver.setup()
     ledger = Ledger(pool)
     await ledger.setup()
-    app.state.pool, app.state.ledger = pool, ledger
+    incidents = Incidents(pool)
+    await incidents.setup()
+    app.state.pool, app.state.ledger, app.state.incidents = pool, ledger, incidents
     app.state.graph = g.build(saver)
     app.state.sem = asyncio.Semaphore(settings.max_concurrent)
     start_http_server(settings.metrics_port)
@@ -128,11 +133,36 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
                 # 실행마다 상한 카운터와 결과를 초기화한다 (messages 는 체크포인트에서 이어 붙는다)
                 inp = {"question": body.question, "mode": body.mode, "answer": None, "alert": body.alert, "started": time.time(), "llm_calls": 0, "tool_calls": 0, "cost_usd": 0.0, "stopped_by": None, "report": None}
                 out = await state.graph.ainvoke(inp, config={"configurable": {"thread_id": body.thread_id}, "recursion_limit": 60}, context=ctx)
-    stopped = out.get("stopped_by") or "done"
+                stopped = out.get("stopped_by") or "done"
+                # 사건 기록: 조사(보고서가 나온 것)만. 저장이 실패해도 보고는 그대로 돌려준다.
+                incident = None
+                if body.mode == "investigate" and (out.get("report") or body.alert):
+                    try:
+                        incident = await state.incidents.record(
+                            thread_id=body.thread_id, question=body.question, alert=body.alert, report=out.get("report"),
+                            trace=tool_trace(out.get("messages") or [], out.get("tool_calls", 0) + 1),
+                            timeline=await snapshot(toolbox, body.alert), stopped_by=stopped,
+                            tool_calls=out.get("tool_calls", 0), cost_usd=usage.cost_usd)
+                    except Exception:  # noqa: BLE001
+                        log.exception("사건 기록 실패 thread=%s", body.thread_id)
     STOPS.labels(stopped).inc()
     REQUESTS.labels("investigate", "200").inc()
     log.info("investigate thread=%s stopped_by=%s tools=%s cost=%.4f", body.thread_id, stopped, out.get("tool_calls"), usage.cost_usd)
-    return {"thread_id": body.thread_id, "mode": body.mode, "answer": out.get("answer"), "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage)}
+    return {"thread_id": body.thread_id, "mode": body.mode, "answer": out.get("answer"), "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage),
+            "incident": incident}
+
+
+@app.get("/incidents", dependencies=[Depends(require_token)])
+async def incidents_list(request: Request, limit: int = 10) -> dict:
+    return {"incidents": await request.app.state.incidents.list(max(1, min(limit, 50)))}
+
+
+@app.get("/incidents/{incident_id}", dependencies=[Depends(require_token)])
+async def incidents_get(incident_id: int, request: Request) -> dict:
+    inc = await request.app.state.incidents.get(incident_id)
+    if inc is None:
+        raise HTTPException(404, f"사건 #{incident_id} 이 없습니다")
+    return {"incident": inc, "markdown": to_markdown(inc)}
 
 
 @app.exception_handler(Exception)
