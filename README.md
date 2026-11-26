@@ -22,8 +22,9 @@ AI는 조사와 제안만 하고, 쓰기 권한은 승인 뒤 n8n만 가집니�
 | `services/mcp-runbook` | 런북과 과거 장애 검색 (RAG, pgvector) | Rust |
 | `demo/demo-app` | 장애 주입용 앱 (`/chaos/*`) | Python |
 | `demo/load-gen` | 부하 생성기 | Python |
-| `ml/training` | IsolationForest 학습, 평가 | Python |
-| `ml/pipelines` | Argo Workflows 템플릿 | YAML |
+| `services/mlflow` | MLflow 서버 이미지 (PostgreSQL, S3 드라이버 포함) | |
+| `ml/anomaly-train` | 이상 탐지 학습 파이프라인 단계 (extract → train → evaluate → register) | Python |
+| `ml/anomaly-serve` | KServe 커스텀 예측 서버 (MLflow pyfunc 모델) | Python |
 | `n8n/workflows` | n8n 워크플로 export (JSON) | |
 | `docs/runbooks` | 장애 대응 런북 (mcp-runbook 수집 대상) | Markdown |
 | `scenarios` | 장애 시나리오와 주입 시각 기록 (모델 평가 정답) | |

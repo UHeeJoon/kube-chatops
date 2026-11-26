@@ -1,11 +1,11 @@
 # 바뀐 서비스만 이미지로 빌드 → ghcr.io 푸시 → cosign 서명(keyless) → kube-chatops-deploy 에 digest bump.
-# 서비스 = Dockerfile 이 있는 services/*, demo/* 폴더. 이미지 이름 = 폴더 이름.
+# 서비스 = Dockerfile 이 있는 services/*, demo/*, ml/* 폴더. 이미지 이름 = 폴더 이름.
 # services/mcp-common 은 이미지가 아니라 MCP 서버들이 함께 쓰는 패키지 (Dockerfile 없음).
 name: build
 on:
   push:
     branches: [main]
-    paths: ["services/**", "demo/**", ".github/workflows/build.yml"]
+    paths: ["services/**", "demo/**", "ml/**", ".github/workflows/build.yml"]
   workflow_dispatch:
     inputs:
       all:
@@ -39,7 +39,7 @@ jobs:
           BEFORE: ${{ github.event.before }}
           ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.all }}
         run: |
-          all=$(for d in services/*/ demo/*/; do d=${d%/}; if [ -f "$d/Dockerfile" ]; then echo "$d"; fi; done)
+          all=$(for d in services/*/ demo/*/ ml/*/; do d=${d%/}; if [ -f "$d/Dockerfile" ]; then echo "$d"; fi; done)
           if [ "$ALL" = "true" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
              || git diff --name-only "$BEFORE" HEAD | grep -q '^.github/workflows/build.yml$'; then
             dirs="$all"

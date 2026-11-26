@@ -1,0 +1,10 @@
+# 서빙 이미지(ml/anomaly-serve)와 pandas, numpy, scikit-learn, joblib 버전을 맞춘다 (KServe 0.21 이 pandas<3).
+# MLflow 서버와는 HTTP 로만 통신하므로 mlflow-skinny 로 충분하다 (DB 드라이버, UI 불필요).
+mlflow-skinny==3.18.0
+scikit-learn==1.9.1
+pandas==2.3.3
+numpy==2.5.5
+joblib==1.6.0
+pyarrow==26.0.1
+boto3==1.44.12
+httpx==0.28.1

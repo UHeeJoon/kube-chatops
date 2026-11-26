@@ -1,0 +1,7 @@
+# 학습 이미지(ml/anomaly-train)와 모델 의존성 버전을 맞춘다. 모델 아티팩트의 requirements.txt 와 같아야 한다.
+kserve==0.21.0
+mlflow-skinny==3.18.0
+scikit-learn==1.9.1
+pandas==2.3.3
+numpy==2.5.5
+joblib==1.6.0

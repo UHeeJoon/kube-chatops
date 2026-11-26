@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     mcp_token_prometheus: SecretStr | None = None
     mcp_token_loki: SecretStr | None = None
     mcp_token_k8s: SecretStr | None = None
+    mcp_token_anomaly: SecretStr | None = None
     max_tool_result_chars: int = 12000
 
     # Postgres (aiops-pg 의 agent DB): 체크포인터와 예산 장부

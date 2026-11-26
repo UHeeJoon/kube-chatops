@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from contextlib import AsyncExitStack
 from typing import Any
@@ -22,8 +23,10 @@ from prometheus_client import Counter, Histogram
 from .config import settings
 
 TOOL_CALLS = Counter("agent_tool_calls_total", "에이전트가 부른 MCP 도구 수", ["server", "tool", "status"])
+MCP_UNAVAILABLE = Counter("agent_mcp_unavailable_total", "연결하지 못해 요청에서 뺀 MCP 서버 수", ["server"])
 TOOL_SECONDS = Histogram("agent_tool_duration_seconds", "MCP 도구 호출 시간", ["server"], buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30))
 tracer = trace.get_tracer("agent.toolbox")
+log = logging.getLogger("agent.toolbox")
 
 
 class Toolbox:
@@ -35,10 +38,16 @@ class Toolbox:
     async def __aenter__(self) -> Toolbox:
         await self._stack.__aenter__()
         for name, (url, token) in settings.mcp_targets().items():
-            http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=httpx2.Timeout(30.0, connect=5.0))
-            client = await self._stack.enter_async_context(Client(streamable_http_client(url, http_client=http)))
+            # 서버 하나가 죽어도 나머지 도구로 조사한다 (그 서버의 도구만 빠진다)
+            try:
+                http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=httpx2.Timeout(30.0, connect=5.0))
+                client = await self._stack.enter_async_context(Client(streamable_http_client(url, http_client=http)))
+                listed = await client.list_tools()
+            except Exception as e:  # noqa: BLE001 — 연결·인증·프로토콜 오류 모두 같은 처리
+                log.warning("MCP 서버 연결 실패, 이번 요청에서 제외: %s (%s: %s)", name, type(e).__name__, e)
+                MCP_UNAVAILABLE.labels(name).inc()
+                continue
             self._clients[name] = client
-            listed = await client.list_tools()
             for t in listed.tools:
                 self.tools.append({"name": f"{name}__{t.name}", "description": t.description or "", "input_schema": t.input_schema})
         self.tools.sort(key=lambda t: t["name"])
