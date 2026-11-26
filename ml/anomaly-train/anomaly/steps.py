@@ -34,6 +34,8 @@ OUTPUTS = Path(os.environ.get("OUTPUTS_DIR", "/tmp/outputs"))
 SCALE_FLOOR = [0.5, 0.01, 0.1, 0.01, 0.005]
 RPS_LOW_QUANTILE = 0.01  # 요청 급감 경계 = 학습 기간 요청 수 1% 지점의 절반
 RPS_LOW_FACTOR = 0.5
+IFOREST_MIN_Z = 2.0  # IsolationForest 판정은 어느 특성이든 |z| 가 이 값 이상일 때만 인정 (z 한계 4 의 절반)
+CV_BLOCKS = 5
 
 
 def emit(name: str, value) -> None:
@@ -94,7 +96,24 @@ def fit_bundle(train: pd.DataFrame, quantile: float, z_limit: float, seed: int =
     threshold = float(np.quantile(-forest.score_samples(z), quantile))
     rps_low = float(np.quantile(x["rps"].dropna(), RPS_LOW_QUANTILE) * RPS_LOW_FACTOR)
     return {"scaler": scaler, "forest": forest, "threshold": threshold, "z_limit": z_limit, "rps_low": rps_low,
-            "features": list(FEATURES), "iforest_needs_neighbor": True}
+            "features": list(FEATURES), "iforest_min_z": IFOREST_MIN_Z}
+
+
+def cv_false_alarms(normal: pd.DataFrame, quantile: float, z_limit: float) -> dict:
+    """정상 구간 전체로 본 오탐: 시간 블록으로 나눠, 각 블록을 나머지 블록으로 학습한 모델로 채점한다.
+
+    평가 데이터의 정상 구간은 뒤쪽 30% 뿐이라 짧고(0.3일) 장애 직후에 몰려 있다. 거기서 센 오탐은 데이터 창이
+    몇 분만 움직여도 2분 ↔ 9분으로 흔들렸다 (11-27). 정상 구간 전체를 쓰면 표본이 3배쯤 된다.
+    """
+    normal = normal.sort_values("ts").reset_index(drop=True)
+    minutes = events = 0
+    for block in np.array_split(normal.index.to_numpy(), CV_BLOCKS):
+        held = normal.loc[block]
+        scored = score_frame(fit_bundle(normal.drop(block), quantile, z_limit), held[RAW_COLUMNS], minute_numbers(held))
+        fa = false_alarms(held["label"], scored["is_anomaly"], minute_numbers(held))
+        minutes += fa["false_alarm_minutes"]
+        events += fa["false_alarm_events"]
+    return {"cv_false_alarm_minutes": minutes, "cv_false_alarm_events": events, "cv_normal_days": round(len(normal) / 1440, 2)}
 
 
 def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_limit: float) -> str:
@@ -120,6 +139,10 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         )
         mlflow.log_metric("threshold", bundle["threshold"])
         mlflow.log_metric("rps_low", bundle["rps_low"])
+        normal_all = df[(df["label"] == 0) & ~df["ambiguous"]]
+        cv = cv_false_alarms(normal_all, quantile, z_limit)
+        mlflow.log_metrics(cv)
+        print(json.dumps(cv))
         # 특성별 평소 값과 z=4 경계 (MLflow 화면에서 "무엇을 기준으로 이상인가" 를 볼 수 있게)
         sc = bundle["scaler"]
         mlflow.log_metrics({f"normal_mean_{f}": float(m) for f, m in zip(FEATURES, sc.mean_)})
@@ -305,6 +328,9 @@ def summary(workflow: str) -> dict:
             "false_alarm_events": m.get("false_alarm_events"),
             "normal_days": m.get("normal_days"),
             "champion_false_alarm_minutes": m.get("champion_false_alarm_minutes"),
+            "cv_false_alarm_minutes": m.get("cv_false_alarm_minutes"),
+            "cv_false_alarm_events": m.get("cv_false_alarm_events"),
+            "cv_normal_days": m.get("cv_normal_days"),
             "recall_by_kind": {k.removeprefix("recall_"): v for k, v in m.items() if k.startswith("recall_")},
             "data": {k: p.get(k) for k in ("data_start", "data_end", "train_rows", "test_rows", "test_anomaly_rows")},
         }

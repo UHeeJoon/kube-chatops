@@ -7,7 +7,7 @@
 출력: 행마다 이상 점수(클수록 이상), 이상 여부, 가장 크게 벗어난 특성과 그 z-score, 특성별 z-score(z_<특성>, 부호 있음),
       요청 급감 여부(traffic_drop).
 
-행은 시간 순서의 연속된 분이어야 한다 (v7 부터 IsolationForest 단독 판정은 이웃한 분을 본다).
+행은 시간 순서의 연속된 분으로 넣는다 (v7 은 IsolationForest 단독 판정에 이웃한 분을 본다).
 """
 
 from __future__ import annotations
@@ -81,12 +81,17 @@ def score_frame(bundle: dict, raw: pd.DataFrame, minute: np.ndarray | None = Non
     rps_low = bundle.get("rps_low")  # v5 이전 모델에는 없다
     drop = (feats["rps"].to_numpy() < rps_low) if rps_low is not None else np.zeros(len(feats), dtype=bool)
     # IsolationForest 단독 판정은 근거가 약하다: 어느 특성도 크게 벗어나지 않았는데 조합이 드물다는 뜻이다.
-    # 11-27 분석에서 정상 구간 오탐이 전부 이 모양(1분짜리 고립, z 1 안팎, 장애 직후)이었다. 이웃한 분도 이상일 때만 인정한다.
-    # z-score·요청 급감은 뚜렷한 신호라 그대로 즉시 판정한다. 이전 모델(키 없음)은 예전처럼 전부 즉시.
+    # 11-27 분석 (시간 순 분할 12회, 정상 5,538분): 오탐 102분이 전부 IsolationForest 단독이었고 최대 z 가 1.4 이하였다
+    # (요청이 평소보다 조금 적은 시간대). 같은 방식으로 잡은 진짜 장애는 분할마다 1~2분뿐.
+    # - v8~: 어느 특성이든 |z| >= iforest_min_z(2) 로 뒷받침될 때만 인정 → 오탐 0분, 재현율 -0.8%p.
+    #   "조합도 드물고 한 특성도 꽤 벗어났다" 일 때만 쓴다 (z 한계 4 에 못 미치는 2~4 구간을 조기에 잡는 역할).
+    # - v7: 이웃한 분도 이상일 때만 인정 (오탐이 절반만 줄어 v8 에서 위 방식으로 바꿈. v7 평가·서빙을 위해 남겨 둔다).
+    # - v6 이전(키 없음): 전부 즉시.
+    iforest_ok = iforest
+    if bundle.get("iforest_min_z") is not None:
+        iforest_ok = iforest_ok & (abs_z.max(axis=1) >= bundle["iforest_min_z"])
     if bundle.get("iforest_needs_neighbor"):
-        iforest_ok = confirm_with_neighbor(iforest, iforest | zscore | drop, minute)
-    else:
-        iforest_ok = iforest
+        iforest_ok = confirm_with_neighbor(iforest_ok, iforest | zscore | drop, minute)
     top_names = [names[i] for i in top]
     top_names = ["rps" if d and not zz else n for n, d, zz in zip(top_names, drop, zscore)]
     return pd.DataFrame(

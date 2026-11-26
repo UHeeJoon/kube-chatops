@@ -442,11 +442,14 @@ if (r.f1 !== undefined) {
     ? `${r.false_alarms_per_day ?? '-'}분/일`
     : `*${r.false_alarm_minutes}분* (${r.false_alarm_events}건, 정상 ${r.normal_days}일 중 · 하루 환산 ${r.false_alarms_per_day}분)` +
       ((r.champion_false_alarm_minutes === null || r.champion_false_alarm_minutes === undefined) ? '' : ` · 지금 서빙은 같은 데이터에서 ${r.champion_false_alarm_minutes}분`);
+  const cv = (r.cv_false_alarm_minutes === null || r.cv_false_alarm_minutes === undefined) ? ''
+    : `• 오탐(교차 검증, 정상 ${r.cv_normal_days}일 전체): *${r.cv_false_alarm_minutes}분* (${r.cv_false_alarm_events}건)\n`;
   blocks.push(sec(
     `*평가* (정상 뒤쪽 + 장애 구간 ${r.data?.test_anomaly_rows ?? '?'}분)\n` +
     `• F1 *${pct(r.f1)}* · precision ${pct(r.precision)} · recall ${pct(r.recall)}\n` +
     `• 장애 종류별 재현율: ${kinds}\n` +
-    `• 오탐 ${fa} · 비교: z-score 기준선 ${pct(r.baseline_f1)}, IsolationForest 단독 ${pct(r.iforest_f1)}\n` +
+    `• 오탐 ${fa}\n` + cv +
+    `• 비교: z-score 기준선 F1 ${pct(r.baseline_f1)}, IsolationForest 단독 F1 ${pct(r.iforest_f1)}\n` +
     `• 지금 서빙(champion): ${champ ? `v${champ.version} · F1 ${pct(champ.f1)}` : '없음'}`));
 }
 if (r.failures?.length) blocks.push(sec('*실패한 단계*\n' + r.failures.map(f => `• ${f.step ?? ''} ${f.message ?? ''}`).join('\n')));
@@ -456,7 +459,9 @@ if (ok && passed && r.version && (!champ || String(champ.version) !== String(r.v
 buttons.push(linkBtn('MLflow 에서 보기', `${MLFLOW_UI}/#/models/demo-anomaly`));
 blocks.push({ type: 'actions', elements: buttons });
 blocks.push(ctx(`워크플로 \`${r.workflow}\` · 데이터 ${String(r.data?.data_start ?? '').slice(0, 16)} ~ ${String(r.data?.data_end ?? '').slice(0, 16)} UTC`));
-return [{ json: { channel: r.slack?.channel ?? null, thread_ts: r.slack?.thread_ts ?? null, text: head.replace(/[*:`]/g, ''), blocks,
+// 결과 카드는 항상 채널에 새 메시지로 올린다 (thread_ts 없음). 요청한 스레드에 달면, 그 카드의 버튼으로 시작한
+// 다음 재학습 결과도 같은 스레드에 달려 오래된 스레드 하나에 계속 쌓인다 (11-27). 승격 진행 상황은 이 카드의 스레드에 달린다.
+return [{ json: { channel: r.slack?.channel ?? null, thread_ts: null, text: head.replace(/[*:`]/g, ''), blocks,
   audit: { flow: 'wf-04-mlops', result: `training:${r.status}`, workflow: r.workflow, version: r.version ?? null, f1: r.f1 ?? null } } }];
 """
 

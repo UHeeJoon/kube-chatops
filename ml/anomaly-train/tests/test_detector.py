@@ -182,6 +182,31 @@ def test_old_bundle_without_the_flag_keeps_old_behaviour():
     assert score_frame(bundle, raw)["is_anomaly"].tolist() == [False, True, False]
 
 
+def test_iforest_alone_needs_a_feature_that_moved():
+    # 11-27: 오탐이 전부 IsolationForest 단독 + 최대 z 1.4 이하였다. z 가 뒷받침할 때만 인정한다
+    bundle, raw = _bundle_where_iforest_fires_on([True, True, True], z_limit=4.0)
+    del bundle["iforest_needs_neighbor"]
+    bundle["iforest_min_z"] = 2.0
+    raw.loc[1, "mem_ratio"] = 0.3 + 2.5  # 가짜 scaler 는 z = 원값 차이 → z 2.5 (한계 4 에는 못 미침)
+    scored = score_frame(bundle, raw)
+    assert scored["iforest_anomaly"].all()
+    assert scored["is_anomaly"].tolist() == [False, True, False]
+
+
+def test_new_models_require_support_for_iforest():
+    train, _ = steps.split(synthetic(), 0.7)
+    bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
+    assert bundle["iforest_min_z"] == 2.0 and "iforest_needs_neighbor" not in bundle
+
+
+def test_cv_false_alarms_uses_all_normal_minutes():
+    df = synthetic()
+    normal = df[(df["label"] == 0) & ~df["ambiguous"]]
+    out = steps.cv_false_alarms(normal, quantile=0.999, z_limit=4.0)
+    assert out["cv_normal_days"] == round(len(normal) / 1440, 2)
+    assert out["cv_false_alarm_minutes"] <= len(normal) * 0.05
+
+
 def test_false_alarms_report_sample_size_and_events():
     y = pd.Series([0, 0, 0, 0, 1, 0])
     pred = pd.Series([True, True, False, True, True, True])
