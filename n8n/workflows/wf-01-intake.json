@@ -37,7 +37,7 @@
         300
       ],
       "parameters": {
-        "jsCode": "// chat-gateway 가 보낸 공통 이벤트 JSON (body). 권한을 확인하고 다음 단계를 정한다.\nconst ROLES = {\"U0B330BGTJA\": \"operator\"};\nconst ev = $json.body ?? {};\nconst role = ROLES[ev.user_id] ?? 'none';\nlet mode = 'route', reply = '';\nif (role === 'none') {\n  mode = 'reply';\n  reply = `권한이 없습니다. 운영자에게 사용자 ID \\`${ev.user_id}\\` 등록을 요청하세요.`;\n} else if (ev.type === 'button_click') {\n  mode = 'reply';\n  reply = '승인 버튼 처리는 아직 준비 중입니다.';\n} else if (!(ev.text ?? '').trim()) {\n  mode = 'reply';\n  reply = '무엇을 도와드릴까요? 예: \"주문 조회가 느려졌어요, 원인 확인해줘\"';\n}\nreturn [{ json: { ...ev, role, mode, reply, started_at: Date.now() } }];"
+        "jsCode": "// chat-gateway 가 보낸 공통 이벤트 JSON (body). 권한을 확인하고 다음 단계를 정한다.\nconst ROLES = {\"U0B330BGTJA\": \"operator\"};\nconst ev = $json.body ?? {};\nconst role = ROLES[ev.user_id] ?? 'none';\nlet mode = 'route', reply = '';\nif (role === 'none') {\n  mode = 'reply';\n  reply = `권한이 없습니다. 운영자에게 사용자 ID \\`${ev.user_id}\\` 등록을 요청하세요.`;\n} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('mlops_')) {\n  mode = 'mlops';  // 재학습·승격 버튼 → WF-04 (역할 확인은 WF-04 가 한다)\n} else if (ev.type === 'button_click') {\n  mode = 'reply';\n  reply = '승인 버튼 처리는 아직 준비 중입니다.';\n} else if (!(ev.text ?? '').trim()) {\n  mode = 'reply';\n  reply = '무엇을 도와드릴까요? 예: \"주문 조회가 느려졌어요, 원인 확인해줘\"';\n}\nreturn [{ json: { ...ev, role, mode, reply, started_at: Date.now() } }];"
       }
     },
     {
@@ -72,6 +72,60 @@
           "combinator": "and"
         },
         "options": {}
+      }
+    },
+    {
+      "id": "998822b8-5508-5835-897d-45af17d99348",
+      "name": "MLOps?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        550
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "918a32b6-1684-5dc7-b7ab-568271e87c14",
+              "leftValue": "={{ $json.mode === 'mlops' || $json.next === 'mlops' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9deb70d3-86aa-59a7-b1f7-fe311546b0b1",
+      "name": "MLOps (WF-04)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1320,
+        650
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "kcwf04mlops00001",
+          "mode": "id"
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
       }
     },
     {
@@ -118,7 +172,7 @@
         200
       ],
       "parameters": {
-        "jsCode": "// /route 결과로 다음 단계를 정한다. investigate → 조사 보고서, query → 짧은 답(answer 모드). 나머지는 바로 답장.\nconst ev = $('준비').item.json;\nconst res = $json;\nlet next = 'reply', reply = '', intent = 'error', mode = 'investigate';\nif (res.statusCode === 200) {\n  intent = res.body.intent;\n  if (intent === 'investigate' || intent === 'query') next = 'investigate';\n  if (intent === 'query') mode = 'answer';\n  else if (intent === 'action_request') reply = '조치 실행은 조사 보고서의 승인 버튼으로만 할 수 있습니다 (승인 흐름 준비 중). 먼저 무엇이 문제인지 물어봐 주세요.';\n  else if (intent === 'mlops') reply = '재학습과 모델 승격은 MLOps 단계에서 붙습니다.';\n  else reply = res.body.reply || '네.';\n} else if (res.statusCode === 429) {\n  reply = '오늘 AI 사용 예산을 다 썼습니다. 내일 다시 시도해 주세요.';\n} else {\n  reply = `요청을 처리하지 못했습니다 (agent ${res.statusCode ?? '연결 실패'}).`;\n}\nreturn [{ json: { ...ev, intent, next, reply, mode, question: ev.text, route_cost: res.body?.usage?.cost_usd ?? 0 } }];"
+        "jsCode": "// /route 결과로 다음 단계를 정한다. investigate → 조사 보고서, query → 짧은 답(answer 모드). 나머지는 바로 답장.\nconst ev = $('준비').item.json;\nconst res = $json;\nlet next = 'reply', reply = '', intent = 'error', mode = 'investigate';\nif (res.statusCode === 200) {\n  intent = res.body.intent;\n  if (intent === 'investigate' || intent === 'query') next = 'investigate';\n  if (intent === 'query') mode = 'answer';\n  else if (intent === 'mlops') next = 'mlops';\n  else if (intent === 'action_request') reply = '조치 실행은 조사 보고서의 승인 버튼으로만 할 수 있습니다 (승인 흐름 준비 중). 먼저 무엇이 문제인지 물어봐 주세요.';\n  else reply = res.body.reply || '네.';\n} else if (res.statusCode === 429) {\n  reply = '오늘 AI 사용 예산을 다 썼습니다. 내일 다시 시도해 주세요.';\n} else {\n  reply = `요청을 처리하지 못했습니다 (agent ${res.statusCode ?? '연결 실패'}).`;\n}\nreturn [{ json: { ...ev, intent, next, reply, mode, question: ev.text, route_cost: res.body?.usage?.cost_usd ?? 0 } }];"
       }
     },
     {
@@ -290,7 +344,7 @@
         ],
         [
           {
-            "node": "답장 정리",
+            "node": "MLOps?",
             "type": "main",
             "index": 0
           }
@@ -324,6 +378,24 @@
         [
           {
             "node": "조사 시작 (WF-02)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "MLOps?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MLOps?": {
+      "main": [
+        [
+          {
+            "node": "MLOps (WF-04)",
             "type": "main",
             "index": 0
           }

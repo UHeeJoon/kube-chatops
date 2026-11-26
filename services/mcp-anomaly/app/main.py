@@ -3,17 +3,23 @@
 도구: detect_anomalies
 흐름: Prometheus 에서 1분 단위 특성 4개를 읽음 → KServe 예측 서버(V1) 호출 → 이상 구간으로 묶어 요약.
 모델은 demo 서비스로만 학습했으므로 대상은 demo 하나다.
+
+모니터: 1분마다 마지막 1분을 모델로 판정해 메트릭으로 내보낸다 (anomaly_model_*). Grafana 대시보드에서
+모델이 지금 무엇을 이상으로 보는지, 어느 특성이 몇 z 벗어났는지, 실제 장애 주입과 맞는지를 본다.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
 import httpx2
 from mcp.server.mcpserver import MCPServer
+from prometheus_client import Counter, Gauge
 
 from mcp_common import ToolInputError, instrumented, serve, to_json
 
@@ -25,6 +31,9 @@ MODEL_URL = os.environ.get(
 )
 MAX_MINUTES = int(os.environ.get("MCP_MAX_RANGE_MINUTES", "360"))
 STEP = 60
+MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL_SECONDS", "60"))  # 0 이면 모니터를 끈다
+log = logging.getLogger("mcp-anomaly")
+logging.getLogger("httpx2").setLevel(logging.WARNING)  # 모니터가 1분에 5번 부른다. 요청마다 로그를 남기지 않는다
 
 prom = httpx2.AsyncClient(base_url=PROM_URL, timeout=20.0)
 model = httpx2.AsyncClient(timeout=20.0)
@@ -43,15 +52,20 @@ def _num(v: str) -> float | None:
     return None if math.isnan(f) or math.isinf(f) else f
 
 
-async def _range(query: str, start: float, end: float) -> dict[int, float | None]:
-    resp = await prom.get(
-        "/api/v1/query_range", params={"query": query, "start": start, "end": end, "step": STEP, "timeout": "20s"}
-    )
-    body = resp.json()
+def _range_params(query: str, start: float, end: float) -> dict:
+    return {"query": query, "start": start, "end": end, "step": STEP, "timeout": "20s"}
+
+
+def _parse_range(body: dict) -> dict[int, float | None]:
     if body.get("status") != "success":
         raise ToolInputError(f"Prometheus 오류: {body.get('errorType')}: {body.get('error')}")
     result = body["data"]["result"]
     return {int(ts): _num(v) for ts, v in result[0]["values"]} if result else {}
+
+
+async def _range(query: str, start: float, end: float) -> dict[int, float | None]:
+    resp = await prom.get("/api/v1/query_range", params=_range_params(query, start, end))
+    return _parse_range(resp.json())
 
 
 KST = timezone(timedelta(hours=9))
@@ -136,5 +150,60 @@ async def detect_anomalies(minutes: int = 60) -> str:
     )
 
 
+# ---- 모니터: 마지막 1분 판정을 메트릭으로 ----
+
+M_ANOMALY = Gauge("anomaly_model_is_anomaly", "마지막 1분 이상 판정 (1=이상)", ["rule"])  # rule: hybrid | iforest | zscore
+M_SCORE = Gauge("anomaly_model_score", "마지막 1분 IsolationForest 이상 점수 (클수록 이상)")
+M_Z = Gauge("anomaly_model_feature_z", "마지막 1분 특성별 z-score (평소 대비 표준편차, 부호 있음)", ["feature"])
+M_INFO = Gauge("anomaly_model_info", "지금 서빙 중인 모델 (값은 항상 1)", ["model_version"])
+M_RUNS = Counter("anomaly_monitor_runs_total", "모니터 판정 횟수", ["status"])
+M_LAST = Gauge("anomaly_monitor_last_success_timestamp_seconds", "마지막 판정 성공 시각")
+
+
+def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
+    # 막 끝난 1분은 rate 가 덜 찼을 수 있어 1분 전까지만 본다. 앞의 몇 분은 빈 값 대비용
+    end = int(time.time()) // STEP * STEP - STEP
+    start = end - 4 * STEP
+    series = {
+        name: _parse_range(prom_sync.get("/api/v1/query_range", params=_range_params(q, start, end)).json())
+        for name, q in FEATURE_QUERIES.items()
+    }
+    if not series["rps"]:
+        raise RuntimeError("demo 요청 지표 없음")
+    ts = max(series["rps"])
+    row = {name: series[name].get(ts) for name in FEATURE_QUERIES}
+    resp = model_sync.post(MODEL_URL, json={"instances": [row]})
+    resp.raise_for_status()
+    body = resp.json()
+    p = body["predictions"][0]
+    M_ANOMALY.labels("hybrid").set(int(p["is_anomaly"]))
+    M_ANOMALY.labels("iforest").set(int(p["iforest_anomaly"]))
+    M_ANOMALY.labels("zscore").set(int(p["zscore_anomaly"]))
+    M_SCORE.set(p["score"])
+    for k, v in p.items():  # 예전 모델(v1)은 z_<특성> 이 없다
+        if k.startswith("z_") and v is not None:
+            M_Z.labels(k.removeprefix("z_")).set(v)
+    version = body.get("model_version") or "unknown"
+    M_INFO.clear()
+    M_INFO.labels(version).set(1)
+    return p
+
+
+def _monitor_loop() -> None:
+    prom_sync = httpx2.Client(base_url=PROM_URL, timeout=20.0)
+    model_sync = httpx2.Client(timeout=20.0)
+    while True:
+        try:
+            monitor_once(prom_sync, model_sync)
+            M_RUNS.labels("ok").inc()
+            M_LAST.set(time.time())
+        except Exception as e:  # noqa: BLE001 — 모니터 실패가 MCP 도구를 멈추면 안 된다
+            M_RUNS.labels("error").inc()
+            log.warning("monitor failed: %s: %s", type(e).__name__, e)
+        time.sleep(MONITOR_INTERVAL)
+
+
 if __name__ == "__main__":
+    if MONITOR_INTERVAL > 0:
+        threading.Thread(target=_monitor_loop, name="monitor", daemon=True).start()
     serve(server, "mcp-anomaly")

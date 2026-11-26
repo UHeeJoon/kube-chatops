@@ -33,6 +33,10 @@ def main() -> None:
     r = sub.add_parser("register", help="모델 레지스트리 등록, alias challenger")
     r.add_argument("--run-id", required=True)
 
+    n = sub.add_parser("notify", help="학습 결과를 n8n(Slack) 으로 보낸다 (Argo onExit)")
+    n.add_argument("--status", required=True)
+    n.add_argument("--failures", default="")
+
     a = p.parse_args()
     if a.step == "extract":
         steps.extract(a.days, a.prefix)
@@ -42,6 +46,8 @@ def main() -> None:
         steps.evaluate(a.run_id, a.test_set, a.min_f1)
     elif a.step == "register":
         steps.register(a.run_id)
+    elif a.step == "notify":
+        steps.notify(a.status, a.failures)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,7 @@ LATENCY = Histogram(
 CHAOS = Gauge("demo_chaos_active", "현재 켜진 장애 주입 (1=켜짐)", ["kind"])
 LEAKED = Gauge("demo_leaked_bytes", "누수 시뮬레이션으로 잡고 있는 메모리")
 
-state = {"latency_ms": 0, "error_rate": 0.0, "leak_mb_per_req": 0}
+state = {"latency_ms": 0, "error_rate": 0.0, "leak_kb_per_req": 0}
 leak: list[bytes] = []
 
 app = FastAPI(title=SERVICE, docs_url=None, redoc_url=None)
@@ -85,8 +85,8 @@ def metrics():
 def get_order(order_id: int):
     if state["latency_ms"]:
         time.sleep(random.uniform(0.5, 1.5) * state["latency_ms"] / 1000)
-    if state["leak_mb_per_req"]:
-        leak.append(b"x" * state["leak_mb_per_req"] * 1024 * 1024)
+    if state["leak_kb_per_req"]:
+        leak.append(b"x" * state["leak_kb_per_req"] * 1024)
         LEAKED.set(sum(len(b) for b in leak))
     if random.random() < state["error_rate"]:
         try:
@@ -121,14 +121,16 @@ def chaos_error(request: Request, rate: float = 0.0):
 
 
 @app.post("/chaos/leak")
-def chaos_leak(request: Request, mb: int = 0):
-    return _set("leak", "leak_mb_per_req", max(0, min(mb, 10)), request)
+def chaos_leak(request: Request, mb: int = 0, kb: int = 0):
+    # 요청마다 mb(MB) 또는 kb(KB) 씩 잡아 둔다. 1MB 단위는 지금 트래픽에서 2분이면 OOM 이라
+    # 알림·조사·학습 데이터가 쌓일 시간이 없다. kb=200 이면 한도(256Mi)까지 약 15분.
+    return _set("leak", "leak_kb_per_req", max(0, min(mb * 1024 + kb, 10 * 1024)), request)
 
 
 @app.post("/chaos/reset")
 def chaos_reset(request: Request):
     _check_token(request)
-    state.update(latency_ms=0, error_rate=0.0, leak_mb_per_req=0)
+    state.update(latency_ms=0, error_rate=0.0, leak_kb_per_req=0)
     leak.clear()
     LEAKED.set(0)
     for kind in ("latency", "error", "leak"):

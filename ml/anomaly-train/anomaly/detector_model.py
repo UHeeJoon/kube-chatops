@@ -4,7 +4,7 @@
 특성 계산을 모델 안에 두어 학습과 서빙이 항상 같은 계산을 쓴다.
 
 입력: 1분 단위 행. 열은 RAW_COLUMNS (Prometheus 에서 읽은 값 그대로).
-출력: 행마다 이상 점수(클수록 이상), 이상 여부, 가장 크게 벗어난 특성과 그 z-score.
+출력: 행마다 이상 점수(클수록 이상), 이상 여부, 가장 크게 벗어난 특성과 그 z-score, 특성별 z-score(z_<특성>, 부호 있음).
 """
 
 from __future__ import annotations
@@ -63,6 +63,8 @@ def score_frame(bundle: dict, raw: pd.DataFrame) -> pd.DataFrame:
             "zscore_anomaly": zscore,
             "top_feature": [FEATURES[i] for i in top],
             "top_z": abs_z.max(axis=1).round(2),
+            # 특성별 z (부호: + 평소보다 큼, - 작음). 대시보드에서 "왜 이상인지" 를 보여 주는 데 쓴다
+            **{f"z_{f}": z[:, i].round(2) for i, f in enumerate(FEATURES)},
         },
         index=raw.index,
     )

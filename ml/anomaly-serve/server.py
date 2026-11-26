@@ -4,7 +4,8 @@
 특성 계산은 모델(detector_model.py, MLflow 아티팩트) 안에 있어 여기서는 행을 그대로 넘긴다.
 
 요청: POST /v1/models/<이름>:predict  {"instances": [{"rps":..,"error_ratio":..,"p95_seconds":..,"mem_ratio":..}, ...]}
-응답: {"predictions": [{"score":..,"is_anomaly":..,"iforest_anomaly":..,"zscore_anomaly":..,"top_feature":..,"top_z":..}, ...],
+응답: {"predictions": [{"score":..,"is_anomaly":..,"iforest_anomaly":..,"zscore_anomaly":..,"top_feature":..,"top_z":..,
+                        "z_<특성>":..(모델 버전에 따라 없을 수 있음)}, ...],
        "model_version": "<MLflow model id>"}
 """
 

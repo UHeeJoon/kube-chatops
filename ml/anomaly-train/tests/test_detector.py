@@ -76,3 +76,13 @@ def test_missing_measurement_is_not_an_anomaly():
     bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
     raw = pd.DataFrame([{"rps": 5.0, "error_ratio": None, "p95_seconds": None, "mem_ratio": None}])
     assert not score_frame(bundle, raw)["is_anomaly"].iloc[0]
+
+
+def test_per_feature_z_explains_the_decision():
+    """대시보드용 특성별 z: 지연 장애에서는 p95 z 가 크게 양수, 나머지는 작다."""
+    train, test = steps.split(synthetic(), 0.7)
+    bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
+    scored = score_frame(bundle, test[RAW_COLUMNS])
+    latency = (test["kind"] == "latency").to_numpy()
+    assert (scored.loc[latency, "z_p95_log_ms"] > 4).all()
+    assert (scored.loc[latency, "z_error_ratio"].abs() < 4).all()

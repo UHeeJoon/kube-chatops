@@ -233,3 +233,75 @@ def register(run_id: str) -> str:
     emit("version", str(mv.version))
     emit("storage_uri", uri)
     return uri
+
+
+# ── notify (Argo onExit) ──
+
+
+def summary(workflow: str) -> dict:
+    """워크플로 이름(= MLflow run 이름)으로 이번 학습 결과와 지금 champion 을 모은다."""
+    client = MlflowClient()
+    out: dict = {"workflow": workflow}
+    exp = client.get_experiment_by_name(EXPERIMENT)
+    runs = client.search_runs([exp.experiment_id], f"attributes.run_name = '{workflow}'", max_results=1) if exp else []
+    if runs:
+        run = runs[0]
+        m, p = run.data.metrics, run.data.params
+        out |= {
+            "run_id": run.info.run_id,
+            "model_id": run.data.tags.get("model_id"),
+            "evaluation": run.data.tags.get("evaluation"),
+            "f1": m.get("test_f1"),
+            "precision": m.get("test_precision"),
+            "recall": m.get("test_recall"),
+            "baseline_f1": m.get("baseline_f1"),
+            "iforest_f1": m.get("iforest_f1"),
+            "false_alarms_per_day": m.get("false_alarms_per_day"),
+            "recall_by_kind": {k.removeprefix("recall_"): v for k, v in m.items() if k.startswith("recall_")},
+            "data": {k: p.get(k) for k in ("data_start", "data_end", "train_rows", "test_rows", "test_anomaly_rows")},
+        }
+        versions = client.search_model_versions(f"name = '{MODEL_NAME}' and run_id = '{run.info.run_id}'")
+        if versions:
+            mv = versions[0]
+            out |= {"version": mv.version, "storage_uri": mv.tags.get("storage_uri")}
+    try:
+        champ = client.get_model_version_by_alias(MODEL_NAME, "champion")
+        champ_run = client.get_run(champ.run_id)
+        out["champion"] = {"version": champ.version, "f1": champ_run.data.metrics.get("test_f1")}
+    except mlflow.exceptions.MlflowException:
+        out["champion"] = None
+    return out
+
+
+def notify(status: str, failures: str = "") -> None:
+    """학습이 끝나면(성공·실패 모두) n8n WF-04 로 결과를 보낸다 → Slack 에 결과와 승격 버튼.
+
+    알림 실패가 학습 결과를 바꾸면 안 되므로 여기서 나는 오류는 기록만 하고 0 으로 끝낸다.
+    """
+    import httpx
+
+    workflow = os.environ.get("ARGO_WORKFLOW_NAME", "local")
+    payload: dict = {"type": "training_finished", "workflow": workflow, "status": status,
+                     "slack": {"channel": os.environ.get("SLACK_CHANNEL") or None,
+                               "thread_ts": os.environ.get("SLACK_THREAD") or None}}
+    if failures and failures not in ("null", "[]"):
+        try:
+            payload["failures"] = [
+                {"step": f.get("displayName"), "message": (f.get("message") or "")[:200]} for f in json.loads(failures)
+            ][:3]
+        except ValueError:
+            payload["failures"] = [{"message": failures[:300]}]
+    try:
+        payload |= summary(workflow)
+    except Exception as e:  # noqa: BLE001 — MLflow 가 죽어도 실패 알림은 가야 한다
+        payload["summary_error"] = f"{type(e).__name__}: {e}"[:300]
+    print(json.dumps(payload, ensure_ascii=False))
+    url, token = os.environ.get("N8N_WEBHOOK_URL"), os.environ.get("N8N_WEBHOOK_TOKEN")
+    if not url or not token:
+        print("N8N_WEBHOOK_URL/TOKEN 없음, 알림 생략")
+        return
+    try:
+        r = httpx.post(url, json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        print(f"n8n 응답 {r.status_code}")
+    except httpx.HTTPError as e:
+        print(f"n8n 알림 실패: {e}")
