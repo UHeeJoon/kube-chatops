@@ -159,16 +159,19 @@ async def _prefetch(toolbox: Toolbox, alert: dict[str, Any]) -> list[str]:
     query = " ".join(str(x) for x in (labels.get("alertname"), notes.get("summary") or notes.get("description")) if x)[:300]
     if not query:
         return []
-    wanted = [("runbook__search_runbooks", "runbook", "관련 런북 (참고 데이터. 무엇을 볼지 알려 줄 뿐 지금 일어난 일의 증거가 아님)"),
-              ("runbook__similar_incidents", "past_incidents", "비슷한 과거 사건 (참고 데이터)")]
+    # 과거 사건은 같은 알림이 울렸던 것을 값으로 찾는다 (재발 횟수와 최근 3건). 그 도구가 없으면 비슷한 글로 찾는다.
+    past = (("runbook__incident_lookup", {"kind": "alert", "value": str(labels.get("alertname")), "k": 3}) if "runbook__incident_lookup" in names and labels.get("alertname")
+            else ("runbook__similar_incidents", {"query": query, "k": 2}))
+    wanted = [("runbook__search_runbooks", {"query": query, "k": 2}, "runbook", "관련 런북 (참고 데이터. 무엇을 볼지 알려 줄 뿐 지금 일어난 일의 증거가 아님)"),
+              (*past, "past_incidents", "같은 알림의 과거 사건 (참고 데이터. total 은 지금까지 기록된 횟수)")]
     wanted = [w for w in wanted if w[0] in names]
-    results = await asyncio.gather(*(toolbox.call(w[0], {"query": query, "k": 2}) for w in wanted), return_exceptions=True)
+    results = await asyncio.gather(*(toolbox.call(w[0], w[1]) for w in wanted), return_exceptions=True)
     parts = []
-    for (_, tag, title), res in zip(wanted, results):
+    for (_, _, tag, title), res in zip(wanted, results):
         if isinstance(res, BaseException) or res[1]:
             continue
         body = res[0].removeprefix("<tool_output>\n").removesuffix("\n</tool_output>")
-        if '"count":0' in body.replace(" ", ""):
+        if '"count":0' in body.replace(" ", "") or '"total":0' in body.replace(" ", ""):
             continue
         parts.append(f"{title}:\n<{tag}>\n{body[:4000]}\n</{tag}>")
     return parts

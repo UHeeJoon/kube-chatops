@@ -5,7 +5,7 @@
 //!   mcp-runbook serve            MCP 서버 (:8080 /mcp, /ingest, /healthz, :9090 /metrics). 시작할 때 런북 폴더를 수집한다
 //!   mcp-runbook download-model   임베딩 모델을 캐시 폴더에 받는다 (이미지 빌드 때 한 번)
 //!
-//! MCP 도구: search_runbooks, similar_incidents, get_document
+//! MCP 도구: search_runbooks, similar_incidents, incident_lookup, get_document
 //! 내부 API: POST /ingest {kind, source, title, content, meta} (에이전트가 사건 보고를 넣는다)
 //!
 //! 문서 내용은 신뢰할 수 없는 데이터다. 도구 결과로만 돌려주고, 이 서버는 그 안의 지시를 따르지 않는다.
@@ -196,6 +196,16 @@ struct SearchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct LookupArgs {
+    /// 개체 종류: ip (출발 IP), rule (WAF 규칙 번호), pod (파드 이름), alert (알림 이름), workload (워크로드 이름)
+    kind: String,
+    /// 정확한 값 (예: "198.51.100.31", "DemoWafAttackBlocked", "942100")
+    value: String,
+    /// 돌려줄 사건 수 (1~10, 기본 5)
+    k: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DocumentArgs {
     /// search_runbooks 또는 similar_incidents 결과의 document_id
     document_id: i64,
@@ -221,6 +231,28 @@ impl RunbookServer {
     #[tool(description = "과거 사건 보고에서 비슷한 것을 찾는다. '전에도 같은 일이 있었나, 그때 원인과 조치는 무엇이었나' 를 볼 때 쓴다. meta 에 사건 번호(incident_id), 알림 이름, 시각이 있다.")]
     async fn similar_incidents(&self, Parameters(args): Parameters<SearchArgs>) -> String {
         self.app.search_json("similar_incidents", "incident", &args.query, args.k).await
+    }
+
+    #[tool(description = "값이 정확히 같은 개체가 나온 과거 사건을 최근 것부터 찾는다. '이 출발 IP 가 전에도 왔나', '이 알림이 얼마나 자주 울렸나', '이 파드가 전에도 격리됐나' 처럼 재발 여부를 볼 때 쓴다. total 은 전체 건수. 비슷한 글을 찾는 similar_incidents 와 달리 값이 일치하는 것만 나온다.")]
+    async fn incident_lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
+        let (kind, value, k) = (args.kind.trim(), args.value.trim(), args.k.unwrap_or(5));
+        if !db::ENTITY_KINDS.contains(&kind) {
+            return format!("입력 오류: kind 는 {} 중 하나여야 합니다", db::ENTITY_KINDS.join(", "));
+        }
+        if !db::valid_entity(value) || !(1..=MAX_K).contains(&k) {
+            return format!("입력 오류: value 는 영문·숫자와 . : - _ / 만 (120자 이하), k 는 1~{MAX_K}");
+        }
+        match db::lookup(&self.app.pool, kind, value, k).await {
+            Ok((total, rows)) => {
+                SEARCHES.with_label_values(&["incident_lookup", if rows.is_empty() { "empty" } else { "hit" }]).inc();
+                json!({ "kind": kind, "value": value, "total": total, "incidents": rows,
+                        "note": "값이 같은 사건입니다. 같은 값이라도 원인이 같다는 뜻은 아닙니다 (같은 IP 의 다른 시도일 수 있음). 전문은 get_document(document_id)." }).to_string()
+            }
+            Err(e) => {
+                SEARCHES.with_label_values(&["incident_lookup", "error"]).inc();
+                format!("도구 실행 실패: {e}")
+            }
+        }
     }
 
     #[tool(description = "문서 하나의 전문을 돌려준다 (런북 전체 절차, 사건 보고 전체). 검색 결과의 일부만으로 부족할 때 쓴다.")]

@@ -187,7 +187,7 @@ class Incidents:
 
 
 def search_document(incident_id: int, report_no: int, alertname: str | None, namespace: str, report: dict[str, Any] | None, question: str,
-                    timeline: dict[str, Any]) -> dict[str, Any]:
+                    timeline: dict[str, Any], pod: str | None = None) -> dict[str, Any]:
     """런북 검색 서버에 넣을 사건 보고 한 건 (마크다운). 나중에 similar_incidents 가 이 글을 찾는다."""
     rep = report or {}
     headline = rep.get("headline") or question[:200]
@@ -207,9 +207,16 @@ def search_document(incident_id: int, report_no: int, alertname: str | None, nam
     ips = [ip.get("client_ip") for ip in (blocked.get("by_ip") or blocked.get("ips") or [])] if isinstance(blocked, dict) else []
     if ips:
         lines += ["", "## 출발 IP", "", ", ".join(map(str, ips[:10]))]
+    # 값으로 찾을 개체 (incident_lookup). 형식 검사는 받는 쪽(mcp-runbook)이 한 번 더 한다.
+    kernel = timeline.get("kernel_events")
+    pods = [p.get("pod") for p in (kernel.get("by_pod") or kernel.get("pods") or [])] if isinstance(kernel, dict) else []
+    rules = sorted({r for ip in (blocked.get("by_ip") or blocked.get("ips") or []) for r in (ip.get("rules") or {})}) if isinstance(blocked, dict) else []
+    entities = {"alert": [alertname] if alertname else [], "ip": [str(x) for x in ips[:20] if x], "rule": [str(r) for r in rules[:20]],
+                "pod": [str(p) for p in pods[:20] if p] + ([str(pod)] if pod else [])}
     return {"kind": "incident", "source": f"incident/{incident_id}/report/{report_no}", "title": f"사건 #{incident_id}: {headline}",
             "content": "\n".join(lines),
-            "meta": {"incident_id": incident_id, "report_no": report_no, "alertname": alertname, "namespace": namespace, "severity": rep.get("status")}}
+            "meta": {"incident_id": incident_id, "report_no": report_no, "alertname": alertname, "namespace": namespace, "severity": rep.get("status"),
+                     "entities": {k: v for k, v in entities.items() if v}}}
 
 
 def _plain(row: dict[str, Any]) -> dict[str, Any]:

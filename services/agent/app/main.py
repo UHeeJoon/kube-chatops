@@ -161,7 +161,8 @@ async def _index_incident(incident: dict[str, Any], body: InvestigateIn, report:
     if not settings.runbook_ingest_url or token is None:
         return
     labels = ((body.alert or {}).get("alerts") or [{}])[0].get("labels") or {}
-    doc = search_document(incident["incident_id"], incident["report_no"], labels.get("alertname"), labels.get("namespace") or "-", report, body.question, timeline)
+    doc = search_document(incident["incident_id"], incident["report_no"], labels.get("alertname"), labels.get("namespace") or "-", report, body.question, timeline,
+                          pod=labels.get("pod"))
     try:
         async with httpx2.AsyncClient(timeout=20) as client:
             r = await client.post(settings.runbook_ingest_url, json=doc, headers={"Authorization": f"Bearer {token.get_secret_value()}"})
