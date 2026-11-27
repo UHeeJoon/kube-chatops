@@ -6,7 +6,7 @@ n8n 화면에서 만든 워크플로는 내보내기 JSON 이 길고 diff 를 �
 
 - WF-01 intake: chat-gateway 이벤트 → 권한 확인 → agent /route → 조사(WF-02) 또는 바로 답장
 - WF-02 investigate: WF-01 또는 Alertmanager → (보안 알림이면 먼저 파드 격리) → agent /investigate → 스레드에 보고서
-- WF-03 actions: Slack 조치 버튼 → operator 확인 → 실행 (지금은 격리 파드 삭제)
+- WF-03 actions: Slack 조치 버튼 → operator 확인 → 실행 (격리 파드 삭제, 재시작, 증설·롤백 커밋)
 - WF-04 mlops: 학습 결과 카드(Argo onExit → webhook), 모델 상태, 재학습 버튼, 승격 버튼 → 배포 저장소 커밋 → 반영 확인 → champion
 - WF-99 audit: 각 흐름의 결과와 오류를 chat-gateway /audit 로 → Loki
 """
@@ -147,8 +147,8 @@ if (role === 'none') {{
   reply = `권한이 없습니다. 운영자에게 사용자 ID \\`${{ev.user_id}}\\` 등록을 요청하세요.`;
 }} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('mlops_')) {{
   mode = 'mlops';  // 재학습·승격 버튼 → WF-04 (역할 확인은 WF-04 가 한다)
-}} else if (ev.type === 'button_click' && String(ev.action?.id ?? '').startsWith('sec_')) {{
-  mode = 'security';  // 보안 조치 버튼 → WF-03 (역할 확인은 WF-03 가 한다)
+}} else if (ev.type === 'button_click' && /^(sec|act)_/.test(String(ev.action?.id ?? ''))) {{
+  mode = 'security';  // 조치 버튼(격리 파드 삭제, 재시작·롤백·증설 승인) → WF-03 (역할 확인은 WF-03 가 한다)
 }} else if (ev.type === 'button_click') {{
   mode = 'reply';
   reply = '승인 버튼 처리는 아직 준비 중입니다.';
@@ -369,6 +369,24 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
     blocks.push(sec(`*조치 제안* _(승인 전에는 실행하지 않음)_\n` +
       acts.map(a => `• \`${a.type}\` ${a.target} · 위험 ${risk[a.risk] ?? a.risk}\n      ◦ ${clip(a.reason, 90)}`).join('\n')));
   }
+  // 승인 버튼. 글자와 확인 창은 여기 고정 문구만 쓴다 (모델이 쓴 문장을 버튼에 넣지 않는다). 대상은 허용 목록에 있는 것만.
+  const APPROVE = {
+    restart: ['재시작 승인', '파드를 하나씩 다시 시작합니다 (rollout restart). 서비스는 유지됩니다. 메모리와 주입된 장애 상태가 초기화됩니다.'],
+    rollback: ['롤백 승인', '배포 저장소에서 이미지를 직전 버전으로 되돌리는 커밋을 올립니다. 검사 → Argo CD 반영까지 3~5분 걸립니다.'],
+    scale: ['증설 승인 (+1)', 'replicas 를 1 늘리는 커밋을 배포 저장소에 올립니다 (최대 4). 반영까지 3~5분 걸립니다.'],
+  };
+  const btns = [];
+  for (const a of acts) {
+    const m = /(?:^|\/)(demo-app)$/.exec(String(a.target ?? '').trim());
+    if (a.type === 'retrain' && !btns.some(b => b.action_id === 'mlops_retrain')) {
+      btns.push({ type: 'button', action_id: 'mlops_retrain', value: 'anomaly-train', text: { type: 'plain_text', text: '재학습 시작' } });
+    } else if (m && APPROVE[a.type] && !btns.some(b => b.action_id === `act_${a.type}`)) {
+      btns.push({ type: 'button', action_id: `act_${a.type}`, value: `demo/${m[1]}`, text: { type: 'plain_text', text: APPROVE[a.type][0] },
+        confirm: { title: { type: 'plain_text', text: `${a.type} demo/${m[1]}` }, confirm: { type: 'plain_text', text: '실행' }, deny: { type: 'plain_text', text: '취소' },
+          text: { type: 'mrkdwn', text: `\`demo/${m[1]}\` ${APPROVE[a.type][1]}` } } });
+    }
+  }
+  if (btns.length) blocks.push({ type: 'actions', elements: btns });
   if (r.data_gaps?.length) blocks.push(sec(`*확인 못 한 것*\n${list(r.data_gaps, 2, 90)}`));
   const q = req.quarantine;
   if (q?.done) {  // 선 조치로 격리한 파드: 조사가 끝나면 사람이 지운다
@@ -724,18 +742,27 @@ mlops = workflow(W, "WF-04 mlops (재학습과 승격)", [
 ))
 
 # ---------------- WF-03 actions ----------------
-# Slack 조치 버튼 → operator 확인 → 실행. 지금은 "격리 파드 삭제" 하나.
-# 안전장치: 격리 라벨이 붙은 demo 파드만 지운다 (버튼 값을 바꿔 다른 파드를 지우려 해도 거절).
+# Slack 조치 버튼 → operator 확인 → 실행.
+#   sec_delete_pod  격리 파드 삭제 (격리 라벨이 붙은 demo 파드만)
+#   act_restart     Deployment 재시작 (파드 템플릿에 restartedAt 어노테이션. Argo CD 가 관리하지 않는 필드라 되돌려지지 않는다)
+#   act_scale       replicas +1  ┐ Argo CD 가 selfHeal 이라 클러스터를 직접 바꾸면 되돌려진다
+#   act_rollback    직전 이미지로 ┘ → 배포 저장소에 커밋한다 (검사 → release → Argo CD)
+# 안전장치: operator 만, 대상은 허용 목록(DEPLOYS)만, 재시작은 5분에 한 번, 증설은 최대 4.
+# 버튼 값(대상)을 바꿔 보내도 여기서 다시 검사하므로 다른 것을 건드릴 수 없다. 모델이 쓴 문장은 실행에 쓰이지 않는다.
 W = WF["actions"]
+DEPLOY_FILE = "https://api.github.com/repos/UHeeJoon/kube-chatops-deploy/contents/demo/__D__/deployment.yaml"
+DEPLOY_COMMITS = "https://api.github.com/repos/UHeeJoon/kube-chatops-deploy/commits?sha=main&per_page=2&path=demo/__D__/deployment.yaml"
 ACT_REQ = """
+const DEPLOYS = ['demo-app'];
 const ev = $json;
 const id = ev.action?.id ?? '';
-const [namespace, pod] = String(ev.action?.value ?? '').split('/');
-let op = id === 'sec_delete_pod' ? 'delete_pod' : 'unknown', note = '';
+const [namespace, name] = String(ev.action?.value ?? '').split('/');
+let op = id === 'sec_delete_pod' ? 'delete_pod' : ['act_restart', 'act_rollback', 'act_scale'].includes(id) ? id.slice(4) : 'unknown', note = '';
 if (ev.role !== 'operator') { op = 'deny'; note = '조치 버튼은 operator 만 누를 수 있습니다.'; }
 else if (op === 'unknown') note = `모르는 조치입니다 (${id}).`;
-else if (namespace !== 'demo' || !/^[a-z0-9.-]{1,253}$/.test(pod ?? '')) { op = 'deny'; note = '대상이 올바르지 않습니다.'; }
-return [{ json: { ...ev, op, namespace, pod, note } }];
+else if (op === 'delete_pod' && (namespace !== 'demo' || !/^[a-z0-9.-]{1,253}$/.test(name ?? ''))) { op = 'deny'; note = '대상이 올바르지 않습니다.'; }
+else if (op !== 'delete_pod' && (namespace !== 'demo' || !DEPLOYS.includes(name))) { op = 'deny'; note = `조치할 수 없는 대상입니다 (허용: ${DEPLOYS.map(d => 'demo/' + d).join(', ')}).`; }
+return [{ json: { ...ev, op, namespace, pod: op === 'delete_pod' ? name : null, deploy: op !== 'delete_pod' && op !== 'deny' && op !== 'unknown' ? name : null, note } }];
 """
 ACT_CHECK = r"""
 const req = $('요청 정리').item.json;
@@ -750,17 +777,97 @@ ACT_DONE = r"""
 const req = $('확인').item.json;
 const ok = $json.statusCode === 200 || $json.statusCode === 202;
 return [{ json: { ...req, note: ok ? `:wastebasket: 격리 파드 \`${req.pod}\` 를 삭제했습니다 (<@${req.user_id}>).` : `삭제 실패 (${$json.statusCode}).`,
-  result: ok ? 'deleted' : 'delete_failed' } }];
+  result: ok ? 'deleted' : 'delete_failed', done: ok ? `격리 파드 \`${req.pod}\` 삭제` : null } }];
 """
-ACT_REPLY = """
+RESTART_PLAN = r"""
+// 지금 상태를 보고 재시작해도 되는지 정한다. 5분 안에 다시 시작한 적이 있으면 거절 (버튼 연타, 재시작 반복 방지).
+const req = $('요청 정리').item.json;
+const res = $json;
+if (res.statusCode !== 200) return [{ json: { ...req, ok: false, result: 'refused', note: `Deployment 조회 실패 (${res.statusCode}).` } }];
+const last = res.body.spec?.template?.metadata?.annotations?.['kubectl.kubernetes.io/restartedAt'];
+const ago = last ? (Date.now() - Date.parse(last)) / 60000 : Infinity;
+if (ago < 5) return [{ json: { ...req, ok: false, result: 'refused', note: `\`${req.deploy}\` 는 ${Math.round(ago)}분 전에 재시작했습니다. 5분 안에는 다시 하지 않습니다.` } }];
+const now = new Date().toISOString();
+return [{ json: { ...req, ok: true, replicas: res.body.spec?.replicas ?? null,
+  patch: { spec: { template: { metadata: { annotations: { 'kubectl.kubernetes.io/restartedAt': now, 'kube-chatops/restarted-by': `slack:${req.user_id}` } } } } } } }];
+"""
+RESTART_DONE = r"""
+const req = $('재시작 판단').item.json;
+const ok = $json.statusCode === 200;
+return [{ json: { ...req, result: ok ? 'restarted' : 'restart_failed', done: ok ? `\`restart\` ${req.namespace}/${req.deploy}` : null,
+  note: ok ? `:arrows_counterclockwise: <@${req.user_id}> 승인으로 \`${req.namespace}/${req.deploy}\` 를 재시작합니다 (파드 ${req.replicas ?? '?'}개를 하나씩 교체, 1분쯤 걸림).`
+    : `재시작 실패 (${$json.statusCode}): ${JSON.stringify($json.body?.message ?? '').slice(0, 200)}` } }];
+"""
+GIT_EDIT = r"""
+// 배포 저장소의 deployment.yaml 에서 한 줄만 바꾼다. 증설: replicas +1 (최대 4). 롤백: 이미지 digest 를 직전 커밋의 것으로.
+const MAX_REPLICAS = 4;
+const req = $('요청 정리').item.json;
+const cur = $('현재 파일').item.json;
+const refuse = note => [{ json: { ...req, ok: false, result: 'refused', note } }];
+if (cur.statusCode !== 200) return refuse(`배포 저장소 파일 읽기 실패 (${cur.statusCode}).`);
+const src = Buffer.from(cur.body.content, 'base64').toString('utf8');
+let out, what, message;
+if (req.op === 'scale') {
+  const m = src.match(/^(\s*replicas: )(\d+)\s*$/m);
+  if (!m) return refuse('replicas 줄을 찾지 못했습니다.');
+  const n = Number(m[2]);
+  if (n >= MAX_REPLICAS) return refuse(`\`${req.deploy}\` 는 이미 replicas ${n} 입니다 (최대 ${MAX_REPLICAS}). 더 늘리지 않습니다.`);
+  out = src.replace(m[0], `${m[1]}${n + 1}`);
+  what = `replicas ${n} → ${n + 1}`;
+  message = `demo: ${req.deploy} replicas ${n} → ${n + 1} (Slack 승인 ${req.user_id})`;
+} else {
+  const re = new RegExp(`(image: ghcr\\.io/uheejoon/kube-chatops/${req.deploy}@)(sha256:[0-9a-f]{64})`);
+  const prev = $json;
+  if (prev.statusCode !== 200) return refuse(`이전 버전 파일 읽기 실패 (${prev.statusCode}).`);
+  const old = Buffer.from(prev.body.content, 'base64').toString('utf8');
+  const c = src.match(re), p = old.match(re);
+  if (!c || !p) return refuse('이미지 줄을 찾지 못했습니다.');
+  if (c[2] === p[2]) return refuse('이 파일의 직전 변경은 이미지 변경이 아니어서 되돌릴 이전 이미지가 없습니다. 배포 저장소 기록에서 직접 고르세요.');
+  out = src.replace(re, `$1${p[2]}`);
+  what = `이미지 ${c[2].slice(7, 19)} → ${p[2].slice(7, 19)}`;
+  message = `demo: ${req.deploy} 직전 이미지로 롤백 (Slack 승인 ${req.user_id})\n\n${c[2]} → ${p[2]}`;
+}
+return [{ json: { ...req, ok: true, what, put: { message, content: Buffer.from(out, 'utf8').toString('base64'), sha: cur.body.sha, branch: 'main' } } }];
+"""
+PREV_REF = r"""
+// 이 파일을 바꾼 최근 커밋 2개 중 두 번째(직전 상태)를 고른다.
+const req = $('요청 정리').item.json;
+const list = Array.isArray($json.body) ? $json.body : [];
+return [{ json: { ...req, prev_sha: list[1]?.sha ?? 'main' } }];
+"""
+GIT_DONE = r"""
+const req = $('파일 고치기').item.json;
+const ok = [200, 201].includes($json.statusCode);
+const sha = ok ? $json.body.commit.sha : '';
+return [{ json: { ...req, result: ok ? (req.op === 'scale' ? 'scale_committed' : 'rollback_committed') : 'commit_failed',
+  done: ok ? `\`${req.op}\` ${req.namespace}/${req.deploy} (${req.what})` : null,
+  note: ok ? `:rocket: <@${req.user_id}> 승인으로 \`${req.namespace}/${req.deploy}\` ${req.what} 커밋을 올렸습니다 (<${$json.body.commit.html_url}|${sha.slice(0, 7)}>). 배포 검사 → release → Argo CD 반영까지 3~5분 걸립니다.`
+    : `커밋 실패 (${$json.statusCode}): ${JSON.stringify($json.body?.message ?? '').slice(0, 200)}` } }];
+"""
+ACT_REPLY = r"""
+// 스레드 답장 + 실행한 조치의 버튼을 카드에서 빼고 "누가 언제 승인" 한 줄로 바꾼다 (두 번 누르지 않게).
 const it = $json;
-return [{ json: { channel: it.channel_id, thread_ts: it.thread_id, text: it.note || '처리했습니다.',
-  audit: { flow: 'wf-03-actions', result: it.result ?? it.op, op: it.op, target: it.pod ? `${it.namespace}/${it.pod}` : null,
-    user_id: it.user_id, role: it.role, channel_id: it.channel_id, thread_id: it.thread_id } } }];
+let card = null;
+if (it.done && it.message_ts && (it.message?.blocks ?? []).length) {
+  const kst = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+  const out = [];
+  for (const b of it.message.blocks) {
+    if (b.type !== 'actions') { out.push(b); continue; }
+    const rest = (b.elements ?? []).filter(e => !(e.action_id === it.action?.id && String(e.value) === String(it.action?.value)));
+    if (rest.length !== (b.elements ?? []).length) out.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `:white_check_mark: ${it.done} · <@${it.user_id}> 승인 · ${kst}` }] });
+    if (rest.length) out.push({ ...b, elements: rest });
+  }
+  card = { channel: it.channel_id, ts: it.message_ts, text: it.message?.text || '조치 승인', blocks: out };
+}
+return [{ json: { channel: it.channel_id, thread_ts: it.thread_id, text: it.note || '처리했습니다.', card,
+  audit: { flow: 'wf-03-actions', result: it.result ?? it.op, op: it.op, target: it.pod ? `${it.namespace}/${it.pod}` : it.deploy ? `${it.namespace}/deployment/${it.deploy}` : null,
+    detail: it.what ?? null, user_id: it.user_id, role: it.role, channel_id: it.channel_id, thread_id: it.thread_id } } }];
 """
 AUDIT_03 = """
-return [{ json: { ...$('답장 정리').item.json.audit, slack_status: $json.statusCode, execution_id: $execution.id } }];
+return [{ json: { ...$('답장 정리').item.json.audit, slack_status: $('답장').item.json.statusCode, execution_id: $execution.id } }];
 """
+_DEPLOY_API = f"={{{{ '{K8S}/apis/apps/v1/namespaces/' + $json.namespace + '/deployments/' + $json.deploy }}}}"
+_FILE = lambda ref: "={{ '" + DEPLOY_FILE.replace("__D__", "' + $json.deploy + '") + "?ref=' + " + ref + " }}"  # noqa: E731
 actions = workflow(W, "WF-03 actions (승인 조치)", [
     node(W, "WF-01 에서 호출", "n8n-nodes-base.executeWorkflowTrigger", 1.1, (0, 300), {"inputSource": "passthrough"}),
     code(W, "요청 정리", (220, 300), ACT_REQ),
@@ -772,16 +879,48 @@ actions = workflow(W, "WF-03 actions (승인 조치)", [
     http(W, "삭제", (1320, 100), "DELETE",
          f"={{{{ '{K8S}/api/v1/namespaces/' + $json.namespace + '/pods/' + $json.pod }}}}", None, "k8s_actions"),
     code(W, "삭제 결과", (1540, 100), ACT_DONE),
-    code(W, "답장 정리", (1760, 300), ACT_REPLY),
-    http(W, "답장", (1980, 300), "POST", f"{GATEWAY}/slack/post", POST_SLACK, "gateway"),
-    code(W, "감사 기록", (2200, 300), AUDIT_03),
-    call_audit(W, "감사 (WF-99)", (2420, 300)),
+    # 재시작
+    if_true(W, "재시작?", (660, 500), "={{ $json.op === 'restart' }}"),
+    http(W, "Deployment 확인", (880, 440), "GET", _DEPLOY_API, None, "k8s_actions"),
+    code(W, "재시작 판단", (1100, 440), RESTART_PLAN),
+    if_true(W, "재시작 가능?", (1320, 440), "={{ $json.ok }}"),
+    http(W, "재시작", (1540, 380), "PATCH", _DEPLOY_API, "={{ JSON.stringify($json.patch) }}", "k8s_actions",
+         headers={"Content-Type": "application/merge-patch+json"}),
+    code(W, "재시작 결과", (1760, 380), RESTART_DONE),
+    # 증설·롤백 (배포 저장소 커밋)
+    if_true(W, "Git 조치?", (880, 700), "={{ ['scale', 'rollback'].includes($json.op) }}"),
+    http(W, "현재 파일", (1100, 700), "GET", _FILE("'main'"), None, "github", headers=GH),
+    if_true(W, "롤백?", (1320, 700), "={{ $('요청 정리').item.json.op === 'rollback' }}"),
+    http(W, "최근 커밋", (1540, 620), "GET",
+         "={{ '" + DEPLOY_COMMITS.replace("__D__", "' + $('요청 정리').item.json.deploy + '") + "' }}", None, "github", headers=GH),
+    code(W, "직전 커밋", (1760, 620), PREV_REF),
+    http(W, "이전 파일", (1980, 620), "GET", _FILE("$json.prev_sha"), None, "github", headers=GH),
+    code(W, "파일 고치기", (2200, 700), GIT_EDIT),
+    if_true(W, "커밋할 것?", (2420, 700), "={{ $json.ok }}"),
+    http(W, "커밋", (2640, 640), "PUT",
+         "={{ '" + DEPLOY_FILE.replace("__D__", "' + $json.deploy + '") + "' }}", "={{ JSON.stringify($json.put) }}", "github", headers=GH),
+    code(W, "커밋 결과", (2860, 640), GIT_DONE),
+    code(W, "답장 정리", (3080, 300), ACT_REPLY),
+    http(W, "답장", (3300, 300), "POST", f"{GATEWAY}/slack/post", POST_SLACK, "gateway"),
+    if_true(W, "카드 고칠 것?", (3520, 300), "={{ !!$('답장 정리').item.json.card }}"),
+    http(W, "카드 고치기", (3740, 220), "POST", f"{GATEWAY}/slack/update", "={{ JSON.stringify($('답장 정리').item.json.card) }}", "gateway"),
+    code(W, "감사 기록", (3960, 300), AUDIT_03),
+    call_audit(W, "감사 (WF-99)", (4180, 300)),
 ], links(
     ("WF-01 에서 호출", "요청 정리"), ("요청 정리", "격리 파드 삭제?"),
-    ("격리 파드 삭제?", "파드 확인", 0), ("격리 파드 삭제?", "답장 정리", 1),
+    ("격리 파드 삭제?", "파드 확인", 0), ("격리 파드 삭제?", "재시작?", 1),
     ("파드 확인", "확인"), ("확인", "격리된 파드?"), ("격리된 파드?", "삭제", 0), ("격리된 파드?", "답장 정리", 1),
     ("삭제", "삭제 결과"), ("삭제 결과", "답장 정리"),
-    ("답장 정리", "답장"), ("답장", "감사 기록"), ("감사 기록", "감사 (WF-99)"),
+    ("재시작?", "Deployment 확인", 0), ("재시작?", "Git 조치?", 1),
+    ("Deployment 확인", "재시작 판단"), ("재시작 판단", "재시작 가능?"), ("재시작 가능?", "재시작", 0), ("재시작 가능?", "답장 정리", 1),
+    ("재시작", "재시작 결과"), ("재시작 결과", "답장 정리"),
+    ("Git 조치?", "현재 파일", 0), ("Git 조치?", "답장 정리", 1),
+    ("현재 파일", "롤백?"), ("롤백?", "최근 커밋", 0), ("롤백?", "파일 고치기", 1),
+    ("최근 커밋", "직전 커밋"), ("직전 커밋", "이전 파일"), ("이전 파일", "파일 고치기"),
+    ("파일 고치기", "커밋할 것?"), ("커밋할 것?", "커밋", 0), ("커밋할 것?", "답장 정리", 1),
+    ("커밋", "커밋 결과"), ("커밋 결과", "답장 정리"),
+    ("답장 정리", "답장"), ("답장", "카드 고칠 것?"), ("카드 고칠 것?", "카드 고치기", 0), ("카드 고칠 것?", "감사 기록", 1),
+    ("카드 고치기", "감사 기록"), ("감사 기록", "감사 (WF-99)"),
 ))
 
 # ---------------- WF-99 audit ----------------
