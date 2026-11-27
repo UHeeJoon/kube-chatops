@@ -85,3 +85,13 @@ def test_every_runbook_checks_block_is_well_formed():
         assert len(checks) == len(lines) <= MAX_CHECKS, path.name  # 모든 줄이 아는 도구이고 JSON 인자다
         assert "```checks" not in body and len(parse_checks("\n".join(lines))) == len(lines)
     assert with_checks >= 5
+
+
+def test_checks_are_found_in_the_shape_the_search_server_returns():
+    # 운영의 get_document 응답: 안내 문장과 블록 사이에 구역 제목이 되풀이된다
+    content = ("## 확인\n- p95 를 본다\n\n에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):\n\n## 확인\n"
+               '```checks\nprometheus__query_instant {"query": "up"}\n```\n\n## 원인 후보\n- CPU 부족')
+    body, checks = split_checks(json.dumps({"content": content}, ensure_ascii=False), {"prometheus__query_instant"})
+    assert checks == [("prometheus__query_instant", {"query": "up"})]
+    left = json.loads(body)["content"]
+    assert "checks" not in left and "미리 실행" not in left and left.count("## 확인") == 1 and "## 원인 후보" in left

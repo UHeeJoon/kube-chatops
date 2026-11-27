@@ -45,7 +45,9 @@ async def prefetch(toolbox: Any, alert: dict[str, Any]) -> list[str]:
     return parts
 
 
-CHECKS_BLOCK = re.compile(r"\n?[^\n]*미리 실행하는 조회[^\n]*\n+```checks\n(.*?)```\n?", re.S)
+# 검색 서버는 문서를 구역으로 나눠 저장했다가 다시 이어 붙여 준다. 그때 코드 블록 앞에 구역 제목("## 확인")이 한 번 더 들어온다
+# (11-28: 그래서 안내 문장 바로 뒤에 블록이 온다고 가정한 첫 정규식은 운영에서 한 건도 못 찾았다). 안내 문장과 되풀이된 제목은 있으면 함께 뗀다.
+CHECKS_BLOCK = re.compile(r"(?:\n[^\n]*미리 실행하는 조회[^\n]*\n+)?(?:## [^\n]*\n)?```checks\n(.*?)```\n?", re.S)
 MAX_CHECKS = 5
 CHECK_RESULT_CHARS = 1500
 
