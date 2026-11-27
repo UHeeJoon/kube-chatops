@@ -70,6 +70,19 @@ jobs:
           PYTHONPATH: ../mcp-common:.
         run: python -m pytest -q tests
 
+  # 런북 검색 서버 단위 테스트 (DB 없이: 청크 나누기, 사건 응답 줄이기, 알림 → 런북 표가 실제 런북과 맞는지)
+  mcp-runbook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/mcp-runbook
+      - name: 단위 테스트
+        working-directory: services/mcp-runbook
+        run: cargo test --quiet
+
   agent:
     runs-on: ubuntu-latest
     steps:
