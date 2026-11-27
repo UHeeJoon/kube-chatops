@@ -15,6 +15,14 @@
 - 탐지기 지표: `time() - anomaly_monitor_last_success_timestamp_seconds`.
 - InferenceService 가 Ready 인지 (`kubectl -n mlops get inferenceservice`).
 
+에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):
+
+```checks
+anomaly__detect_anomalies {"minutes": 60}
+prometheus__list_firing_alerts {"namespace": "demo"}
+prometheus__query_instant {"query": "demo_chaos_active{namespace=\"demo\"}"}
+```
+
 ## 겪은 사례 (2026-11-27)
 
 - v8 승격 직후 예측이 전부 500 이었다. 예측 서버가 입력 열을 4개로 고정해 두어, 5개(`mem_growth` 포함)를 요구하는 모델에 열을 버리고 넘겼다. 15분 동안 이상 탐지가 멈췄다.
