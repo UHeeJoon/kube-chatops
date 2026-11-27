@@ -12,7 +12,8 @@
 비용 (프롬프트 캐시) 규칙. 캐시는 앞부분이 1바이트라도 같아야 맞는다.
 - 모든 조사·답 호출은 같은 모델, 같은 도구 목록(이름순 + submit_report), 같은 시스템 프롬프트, 같은 effort 로 부른다.
   보고서를 따로 부르면서 tool_choice, effort, 출력 형식을 바꾸면 대화 캐시가 통째로 깨져 다시 쓰게 된다 (측정: 조사 비용의 44%).
-- 시스템 프롬프트 끝에 캐시 지점을 고정해서 서로 다른 질문끼리도 도구 + 시스템(약 4천 토큰)을 공유한다.
+- 시스템 프롬프트 끝에 캐시 지점을 고정해서 서로 다른 질문끼리도 도구 + 시스템(약 8.8천 토큰)을 공유한다. 이 구간은 1시간 캐시다
+  (SYSTEM_CACHE_TTL. 알림과 질문이 5분~1시간 간격으로 오는 일이 많아, 5분 캐시로는 조사마다 다시 썼다).
   대화 끝부분은 요청 최상위 cache_control(자동)이 따라간다.
 - 바뀌는 값(시각, 모드, 질문, 알림)은 user 메시지에만 넣는다.
 
@@ -55,7 +56,9 @@ client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_
 FALLBACK = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
 
 # 시스템 프롬프트 끝에 캐시 지점 고정 (도구 + 시스템을 모든 요청이 공유)
-SYSTEM_BLOCKS = [{"type": "text", "text": INVESTIGATE_SYSTEM, "cache_control": {"type": "ephemeral"}}]
+# 도구 정의와 시스템 프롬프트는 요청마다 같다 → 여기까지를 길게(기본 1시간) 캐시한다. 대화 쪽 자동 캐시(5분)보다 앞에 있어야 한다.
+SYSTEM_CACHE = {"type": "ephemeral", "ttl": "1h"} if settings.system_cache_ttl == "1h" else {"type": "ephemeral"}
+SYSTEM_BLOCKS = [{"type": "text", "text": INVESTIGATE_SYSTEM, "cache_control": SYSTEM_CACHE}]
 REPORT = REPORT_TOOL["name"]
 
 
@@ -154,6 +157,7 @@ async def _prefetch(toolbox: Toolbox, alert: dict[str, Any]) -> list[str]:
     """알림 조사는 관련 런북과 과거 사건을 미리 붙여 준다 (모델이 찾으러 한 턴을 쓰지 않게, 그리고 빠뜨리지 않게).
 
     알림 이름은 런북에 그대로 적혀 있어 낱말 검색으로 거의 틀리지 않는다. LLM 을 거치지 않으므로 비용은 검색 두 번(수십 ms)뿐이다.
+    런북은 1순위 하나만 붙인다 (알림 이름 질의는 recall@1 1.00. 둘째 런북은 조사마다 약 1천 토큰을 쓰고 거의 읽히지 않았다).
     실패하면 그냥 없이 간다.
     """
     names = {t["name"] for t in toolbox.tools}
@@ -165,7 +169,7 @@ async def _prefetch(toolbox: Toolbox, alert: dict[str, Any]) -> list[str]:
     # 과거 사건은 같은 알림이 울렸던 것을 값으로 찾는다 (재발 횟수와 최근 3건). 그 도구가 없으면 비슷한 글로 찾는다.
     past = (("runbook__incident_lookup", {"kind": "alert", "value": str(labels.get("alertname")), "k": 3}) if "runbook__incident_lookup" in names and labels.get("alertname")
             else ("runbook__similar_incidents", {"query": query, "k": 2}))
-    wanted = [("runbook__search_runbooks", {"query": query, "k": 2}, "runbook", "관련 런북 (참고 데이터. 무엇을 볼지 알려 줄 뿐 지금 일어난 일의 증거가 아님)"),
+    wanted = [("runbook__search_runbooks", {"query": query, "k": 1}, "runbook", "관련 런북 (참고 데이터. 무엇을 볼지 알려 줄 뿐 지금 일어난 일의 증거가 아님)"),
               (*past, "past_incidents", "같은 알림의 과거 사건 (참고 데이터. total 은 지금까지 기록된 횟수)")]
     wanted = [w for w in wanted if w[0] in names]
     results = await asyncio.gather(*(toolbox.call(w[0], w[1]) for w in wanted), return_exceptions=True)

@@ -17,7 +17,7 @@ from .config import settings
 
 log = logging.getLogger("agent.cost")
 
-# 1M 토큰당 USD (입력, 출력, 캐시 읽기 배수). 캐시 쓰기(5분 TTL)는 입력의 1.25배.
+# 1M 토큰당 USD (입력, 출력, 캐시 읽기 배수). 캐시 쓰기는 입력의 1.25배(5분 TTL) 또는 2배(1시간 TTL).
 # 캐시 읽기 배수는 모델마다 다르다 (Opus 5.5, Sonnet 5.5 는 0.05배). 확인하지 못한 값은 0.1배로 보수적으로 잡는다.
 # 표에 없는 모델은 가장 비싼 값으로 계산해 예산을 보수적으로 잡는다.
 PRICES = {
@@ -62,12 +62,15 @@ def cost_of(model: str, stage: str, usage) -> tuple[float, int, int]:
     cache_read = usage.cache_read_input_tokens or 0
     fresh = usage.input_tokens or 0
     out = usage.output_tokens or 0
-    cost = (fresh * p_in + cache_write * p_in * 1.25 + cache_read * p_in * read_mult + out * p_out) / 1_000_000
+    # 캐시 쓰기는 유효 시간에 따라 값이 다르다: 5분 1.25배, 1시간 2배. 나눠 준 값이 없으면 전부 5분으로 본다.
+    detail = getattr(usage, "cache_creation", None)
+    write_1h = min(cache_write, int(getattr(detail, "ephemeral_1h_input_tokens", 0) or 0)) if detail is not None else 0
+    cost = (fresh * p_in + (cache_write - write_1h) * p_in * 1.25 + write_1h * p_in * 2.0 + cache_read * p_in * read_mult + out * p_out) / 1_000_000
     for kind, n in (("input", fresh), ("cache_write", cache_write), ("cache_read", cache_read), ("output", out)):
         TOKENS.labels(model, stage, kind).inc(n)
     # 호출 하나마다 한 줄. 캐시가 어느 단계에서 깨지는지 Loki 에서 바로 본다.
-    log.info("llm_call stage=%s model=%s input=%d cache_write=%d cache_read=%d output=%d cost_usd=%.5f",
-             stage, model, fresh, cache_write, cache_read, out, cost)
+    log.info("llm_call stage=%s model=%s input=%d cache_write=%d cache_read=%d output=%d cost_usd=%.5f write_1h=%d",
+             stage, model, fresh, cache_write, cache_read, out, cost, write_1h)
     return cost, fresh + cache_write + cache_read, out
 
 

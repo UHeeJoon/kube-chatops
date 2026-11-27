@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     model: str = "claude-opus-5-5"
     route_model: str = "claude-haiku-5-5"
     investigate_effort: str = "medium"
+    # 시스템 프롬프트 + 도구 정의(약 8.8천 토큰)의 캐시 유효 시간. "1h" 는 쓰기가 2배(5분은 1.25배)지만 한 시간 동안 읽기(0.05배)로 쓴다.
+    # 알림과 질문은 대개 5분~1시간 간격으로 온다 (11-27 기록: 캐시 없이 시작한 34회 중 22회가 그 구간) → 조사마다 다시 쓰던 $0.044 가 $0.002 가 된다.
+    # 한 시간 넘게 조용하다 오는 요청은 $0.026 더 든다. 되돌리려면 SYSTEM_CACHE_TTL=5m.
+    system_cache_ttl: str = "1h"
     route_effort: str = "low"
 
     # 조사 한 번의 상한 (호출 수, 시간, 비용)
