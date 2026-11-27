@@ -102,6 +102,11 @@ def main() -> None:
         print(("놓침" if m[2] not in m[3] else "확인"), m)
     if a.set == "dev" and sum(x[1] for x in total) / len(total) < 0.9:
         sys.exit(1)
+    # 알림 조사의 선조회는 1순위 런북만 붙인다. 알림 이름 질문은 1순위가 정답이어야 한다
+    alerts = by_kind.get("알림", [])
+    if a.set == "dev" and alerts and not all(x[0] for x in alerts):
+        print("알림 이름 질문의 1순위가 정답이 아니다")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

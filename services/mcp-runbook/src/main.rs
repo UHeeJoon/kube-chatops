@@ -16,7 +16,8 @@ mod embed;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -44,6 +45,8 @@ use embed::Embedder;
 const MAX_K: i64 = 10;
 /// 도구 결과에서 청크 본문을 자르는 길이. 전문은 get_document 로 본다.
 const SNIPPET_CHARS: usize = 700;
+/// 알림의 주인 런북을 찾을 때 넉넉히 가져오는 개수
+const OWNER_SEARCH_K: i64 = 8;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 static SEARCHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -75,6 +78,51 @@ static DOCUMENTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 struct App {
     pool: PgPool,
     embedder: Embedder,
+    /// 알림 이름 → 그 알림을 맡은 런북(source). 런북 머리말의 "관련 알림:" 줄에서 읽는다.
+    owners: Arc<RwLock<HashMap<String, String>>>,
+}
+
+/// 런북들의 "관련 알림:" 줄에서 알림 이름 → 런북을 만든다. 두 런북이 같은 알림을 적었으면 정할 수 없으므로 뺀다 (검색 순위에 맡긴다).
+///
+/// 알림 이름은 정확한 열쇠다. 검색 순위에만 맡기면 본문에서 그 이름을 언급만 한 런북이 1순위가 될 수 있다
+/// (11-29: `DemoMemoryNearLimit` 로 찾으면 그 이름을 "함께 울리면" 이라고 언급한 다른 런북이 메모리 누수 런북을 밀어냈다).
+fn alert_owners(files: &[(String, String)]) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut shared: Vec<String> = Vec::new();
+    for (source, content) in files {
+        let Some(line) = content.lines().take(12).find(|l| l.trim_start().starts_with("관련 알림:")) else { continue };
+        for name in line.split('`').skip(1).step_by(2) {
+            let ok = !name.is_empty() && name.len() <= 80 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !ok {
+                continue;
+            }
+            match out.get(name) {
+                Some(prev) if prev != source => shared.push(name.to_string()),
+                _ => {
+                    out.insert(name.to_string(), source.clone());
+                }
+            }
+        }
+    }
+    for name in shared {
+        out.remove(&name);
+    }
+    out
+}
+
+/// 질의에 들어 있는 알림 이름의 주인 런북 (낱말 단위로 정확히 같을 때만).
+fn owner_of<'a>(owners: &'a HashMap<String, String>, query: &str) -> Option<&'a String> {
+    query.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).find_map(|w| owners.get(w))
+}
+
+/// 주인 런북을 맨 앞으로 옮기고 k 개로 자른다. 결과에 없으면 순서를 바꾸지 않는다.
+fn promote(mut hits: Vec<db::Hit>, owner: Option<&String>, k: usize) -> Vec<db::Hit> {
+    if let Some(i) = owner.and_then(|o| hits.iter().position(|h| &h.source == o)) {
+        let hit = hits.remove(i);
+        hits.insert(0, hit);
+    }
+    hits.truncate(k);
+    hits
 }
 
 impl App {
@@ -102,6 +150,7 @@ impl App {
     /// 런북 폴더(*.md)를 수집하고, 폴더에서 사라진 런북은 지운다.
     async fn ingest_dir(&self, dir: &Path) -> Result<()> {
         let mut keep = Vec::new();
+        let mut files: Vec<(String, String)> = Vec::new();
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
             .with_context(|| format!("런북 폴더를 읽지 못했다: {}", dir.display()))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -119,9 +168,15 @@ impl App {
                     "error"
                 }
             };
+            files.push((source.clone(), content));
             INGESTED.with_label_values(&["runbook", result]).inc();
             tracing::info!(source, result, "런북 수집");
             keep.push(source);
+        }
+        let owners = alert_owners(&files);
+        tracing::info!(alerts = owners.len(), "알림 → 런북 표");
+        if let Ok(mut guard) = self.owners.write() {
+            *guard = owners;
         }
         let removed = db::prune_runbooks(&self.pool, &keep).await?;
         tracing::info!(runbooks = keep.len(), removed, "런북 폴더 수집 완료");
@@ -148,9 +203,12 @@ impl App {
         if !(1..=MAX_K).contains(&k) {
             return format!("입력 오류: k 는 1~{MAX_K} 사이여야 합니다");
         }
+        // 질의에 알림 이름이 있으면 그 알림을 맡은 런북을 1순위로 올린다 (넉넉히 찾은 뒤 앞으로 옮긴다)
+        let owner = if kind == "runbook" { self.owners.read().ok().and_then(|o| owner_of(&o, query).cloned()) } else { None };
         let found = async {
             let embedding = self.embedder.query(query).await?;
-            db::search(&self.pool, kind, query, &embedding, k).await
+            let hits = db::search(&self.pool, kind, query, &embedding, if owner.is_some() { k.max(OWNER_SEARCH_K) } else { k }).await?;
+            Ok::<_, anyhow::Error>(promote(hits, owner.as_ref(), k as usize))
         }
         .await;
         SEARCH_SECONDS.with_label_values(&[tool]).observe(started.elapsed().as_secs_f64());
@@ -402,7 +460,7 @@ async fn serve() -> Result<()> {
     db::migrate(&pool).await?;
     let threads = env_or("EMBED_THREADS", "2").parse().context("EMBED_THREADS")?;
     let embedder = Embedder::load(model_dir(), threads)?;
-    let app = App { pool, embedder };
+    let app = App { pool, embedder, owners: Arc::new(RwLock::new(HashMap::new())) };
     // 지표를 0 으로 미리 등록한다
     let _ = (&*SEARCHES, &*INGESTED, &*SEARCH_SECONDS, &*DOCUMENTS);
 
@@ -493,6 +551,48 @@ mod tests {
     #[test]
     fn incident_source_only() {
         assert!(super::incident_source("incident/7/report/1"));
+    }
+
+    #[test]
+    fn real_runbooks_name_their_alerts() {
+        let files: Vec<(String, String)> = std::fs::read_dir("runbooks").unwrap().filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .map(|p| (format!("runbooks/{}", p.file_name().unwrap().to_str().unwrap()), std::fs::read_to_string(&p).unwrap())).collect();
+        let owners = super::alert_owners(&files);
+        for (alert, file) in [("DemoHighLatency", "high-latency.md"), ("DemoHighErrorRate", "high-error-rate.md"), ("DemoMemoryNearLimit", "memory-leak-oom.md"),
+                              ("DemoMemoryLeakSuspected", "memory-leak-oom.md"), ("DemoSinglePodAnomaly", "anomaly-findings.md"), ("DemoAnomalyUnexplained", "anomaly-findings.md"),
+                              ("AnomalyBaselineDrift", "anomaly-findings.md"), ("AnomalyMonitorStale", "anomaly-monitor.md"), ("DemoWafAttackBlocked", "waf-attack.md")] {
+            assert_eq!(owners.get(alert).map(String::as_str), Some(format!("runbooks/{file}").as_str()), "{alert}");
+        }
+    }
+
+    fn hit(source: &str) -> db::Hit {
+        db::Hit { document_id: 1, title: source.into(), source: source.into(), heading: String::new(), content: String::new(), meta: json!({}),
+                  score: 0.0, vector_rank: None, text_rank: Some(1) }
+    }
+
+    #[test]
+    fn alert_name_finds_the_runbook_that_owns_it() {
+        let files = vec![
+            ("runbooks/memory.md".to_string(), "# 메모리\n\n관련 알림: `DemoMemoryNearLimit`, `DemoPodRestarting`. 시나리오 S1.\n".to_string()),
+            ("runbooks/deploy.md".to_string(), "# 배포\n\n관련 알림: `DemoPodRestarting`, Argo CD 앱 Degraded.\n".to_string()),
+            ("runbooks/findings.md".to_string(), "# 판정\n\n관련 알림: `DemoSinglePodAnomaly`.\n\n## 판단\n- `DemoMemoryNearLimit` 가 함께 울리면\n".to_string()),
+        ];
+        let owners = super::alert_owners(&files);
+        assert_eq!(owners.get("DemoMemoryNearLimit").map(String::as_str), Some("runbooks/memory.md"));
+        assert_eq!(owners.get("DemoSinglePodAnomaly").map(String::as_str), Some("runbooks/findings.md"));
+        // 두 런북이 적은 알림은 정하지 않는다
+        assert!(!owners.contains_key("DemoPodRestarting"));
+        assert_eq!(super::owner_of(&owners, "DemoMemoryNearLimit 메모리 사용량이 한도에 가깝다").map(String::as_str), Some("runbooks/memory.md"));
+        assert!(super::owner_of(&owners, "DemoMemoryNearLimitX 비슷한 이름").is_none());
+        assert!(super::owner_of(&owners, "메모리가 계속 늘어난다").is_none());
+        // 본문에서 언급만 한 런북이 1순위여도 주인이 앞으로 온다
+        let out = super::promote(vec![hit("runbooks/findings.md"), hit("runbooks/memory.md"), hit("runbooks/deploy.md")], owners.get("DemoMemoryNearLimit"), 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, "runbooks/memory.md");
+        // 주인이 결과에 없으면 순서를 바꾸지 않는다
+        let out = super::promote(vec![hit("runbooks/a.md"), hit("runbooks/b.md")], owners.get("DemoMemoryNearLimit"), 2);
+        assert_eq!(out[0].source, "runbooks/a.md");
         for bad in ["runbooks/waf-attack.md", "incident/7/report/1/../x", "incident//report/1", "incident/7/report/", "incident/a/report/1", "incident/7/report/1 ", "INCIDENT/7/report/1", ""] {
             assert!(!super::incident_source(bad), "{bad}");
         }
