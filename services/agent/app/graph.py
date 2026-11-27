@@ -46,7 +46,10 @@ from .safety import clean, guard_tool_text, verify_references
 from .prompts import FINISH_NOTE, INVESTIGATE_SYSTEM, REPORT_TOOL, ROUTE_SCHEMA, ROUTE_SYSTEM
 from .toolbox import Toolbox
 from .prefetch import prefetch as _prefetch
+from .models import choose as _choose, sticky as _sticky
 
+MODEL_PICK = Counter("agent_model_pick_total", "요청마다 고른 모델. tier: answer | light | heavy | thread(스레드가 쓰던 것)", ["tier", "model", "effort"])
+LIGHT_ALERTS = frozenset(a.strip() for a in settings.light_alerts.split(",") if a.strip())
 PREFETCH = Counter("agent_prefetch_total", "알림 조사의 선조회 결과 (런북을 붙였나, 확인 항목을 미리 실행했나)", ["alertname", "runbook", "checks"])
 UNVERIFIED_REFS = Counter("agent_unverified_references_total", "보고서의 참고 항목 가운데 조회 기록에 없던 것")
 
@@ -77,6 +80,8 @@ class State(TypedDict, total=False):
     finishing: bool  # 상한 도달 안내를 붙였음 (다음 호출이 마지막)
     stopped_by: str | None
     report: dict[str, Any] | None
+    model: str  # 이 스레드가 쓰는 모델과 effort. 첫 턴에 정하고 바꾸지 않는다 (thinking 블록, 대화 캐시)
+    effort: str
 
 
 @dataclass
@@ -147,6 +152,10 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
     now = datetime.now(ZoneInfo(settings.budget_timezone)).strftime("%Y-%m-%d %H:%M %Z")
     kind = "질문 (짧게 답하기)" if _is_answer(state) else "조사 (원인을 찾아 submit_report 로 보고)"
     parts = [f"요청 종류: {kind}", f"현재 시각: {now}", f"질문: {state['question']}"]
+    picked = _choose(state.get("mode") or "investigate", state.get("alert"), heavy=(settings.model, settings.investigate_effort),
+                     light=(settings.light_model, settings.light_effort), answer=(settings.answer_model, settings.answer_effort), light_alerts=LIGHT_ALERTS)
+    model, effort, tier = _sticky(state.get("model"), state.get("effort"), bool(state.get("messages")), picked, (settings.model, settings.investigate_effort))
+    MODEL_PICK.labels(tier, model, effort).inc()
     if state.get("alert"):
         # 알림 내용도 외부 입력이므로 데이터로 표시한다 (라벨·주석에 공격자가 만든 글이 들어올 수 있다: 요청 경로, 파드 이름)
         body, _ = guard_tool_text(json.dumps(state["alert"], ensure_ascii=False, sort_keys=True)[:4000])
@@ -157,13 +166,13 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
         PREFETCH.labels(name, "runbook" if any("<runbook>" in p for p in fetched) else "none",
                         "yes" if any("<checks>" in p for p in fetched) else "no").inc()
         parts += fetched
-    return {"messages": [{"role": "user", "content": "\n\n".join(parts)}]}
+    return {"messages": [{"role": "user", "content": "\n\n".join(parts)}], "model": model, "effort": effort}
 
 
 async def investigate(state: State, runtime: Runtime[Ctx]) -> dict:
     ctx = runtime.context
     resp = await _llm(
-        ctx, "answer" if _is_answer(state) else "investigate", model=settings.model, effort=settings.investigate_effort,
+        ctx, "answer" if _is_answer(state) else "investigate", model=state.get("model") or settings.model, effort=state.get("effort") or settings.investigate_effort,
         system=SYSTEM_BLOCKS, messages=state["messages"], tools=ctx.toolbox.tools + [REPORT_TOOL],
     )
     update: dict[str, Any] = {

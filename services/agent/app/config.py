@@ -11,10 +11,19 @@ class Settings(BaseSettings):
     api_token: SecretStr = Field(min_length=32)
     anthropic_api_key: SecretStr
 
-    # 모델: 조사는 Opus. /route 는 짧은 분류라 Haiku + effort low (Opus 대비 입력 단가 1/40).
+    # 모델은 일의 종류에 따라 고른다 (app/models.py). /route 는 짧은 분류라 Haiku + effort low (Opus 대비 입력 단가 1/40).
+    # model / investigate_effort: 무거운 조사 (보안 사건, 비교해 보지 않은 알림, 사람이 시킨 조사).
     model: str = "claude-opus-5-5"
     route_model: str = "claude-haiku-5-5"
     investigate_effort: str = "medium"
+    # 질문(단순 조회, 정리): 도구 한두 번과 짧은 답.
+    answer_model: str = "claude-sonnet-5-5"
+    answer_effort: str = "low"
+    # 가벼운 알림 조사: 런북의 확인 조회만으로 원인이 드러나는 알림. 11-28 에 같은 장애로 비교해 Opus medium 과 같은 원인·조치를 낸 것만 넣는다
+    # (지연 $0.040 → $0.018, 오류 $0.047 → $0.019, 파드 하나 $0.066 → $0.022). 보안 알림은 공격자가 만든 글을 읽으므로 넣지 않는다.
+    light_model: str = "claude-sonnet-5-5"
+    light_effort: str = "low"
+    light_alerts: str = "DemoHighLatency,DemoHighErrorRate,DemoSinglePodAnomaly"
     # 시스템 프롬프트 + 도구 정의(약 8.8천 토큰)의 캐시 유효 시간. "1h" 는 쓰기가 2배(5분은 1.25배)지만 한 시간 동안 읽기(0.05배)로 쓴다.
     # 알림과 질문은 대개 5분~1시간 간격으로 온다 (11-27 기록: 캐시 없이 시작한 34회 중 22회가 그 구간) → 조사마다 다시 쓰던 $0.044 가 $0.002 가 된다.
     # 한 시간 넘게 조용하다 오는 요청은 $0.026 더 든다. 되돌리려면 SYSTEM_CACHE_TTL=5m.
@@ -30,7 +39,7 @@ class Settings(BaseSettings):
     daily_budget_usd: float = 5.0
     budget_timezone: str = "Asia/Seoul"
     max_concurrent: int = 2
-    # 질문 모드(단순 조회): 짧은 답, 작은 상한. effort 는 조사와 같게 둔다 (effort 가 바뀌면 같은 스레드의 대화 캐시가 깨진다)
+    # 질문 모드(단순 조회): 짧은 답, 작은 상한. 모델과 effort 는 스레드의 첫 턴에 정해 끝까지 쓴다 (바꾸면 그 스레드의 대화 캐시가 깨진다)
     answer_max_llm_calls: int = 4
     answer_max_tool_calls: int = 5
 

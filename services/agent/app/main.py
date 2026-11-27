@@ -150,8 +150,8 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
                         log.exception("사건 기록 실패 thread=%s", body.thread_id)
     STOPS.labels(stopped).inc()
     REQUESTS.labels("investigate", "200").inc()
-    log.info("investigate thread=%s stopped_by=%s tools=%s cost=%.4f", body.thread_id, stopped, out.get("tool_calls"), usage.cost_usd)
-    return {"thread_id": body.thread_id, "mode": body.mode, "answer": out.get("answer"), "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage),
+    log.info("investigate thread=%s mode=%s model=%s/%s stopped_by=%s tools=%s cost=%.4f", body.thread_id, body.mode, out.get("model"), out.get("effort"), stopped, out.get("tool_calls"), usage.cost_usd)
+    return {"thread_id": body.thread_id, "mode": body.mode, "answer": out.get("answer"), "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage), "model": out.get("model"), "effort": out.get("effort"),
             "incident": incident, "injection_suspected": suspicious}
 
 
