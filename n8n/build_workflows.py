@@ -152,7 +152,8 @@ if (role === 'none') {{
 }} else if (ev.type === 'button_click') {{
   mode = 'reply';
   reply = '승인 버튼 처리는 아직 준비 중입니다.';
-}} else if (/^(사건|보고서|incidents?)\\s*(목록|list|#?\\d+)?$/i.test((ev.text ?? '').trim())) {{
+}} else if ((t => t.length <= 20 && /^(사건|보고서|incidents?)(\\s|$)/i.test(t) && (/목록|기록|list|\\d/i.test(t) || /^\\S+$/.test(t)))((ev.text ?? '').trim())) {{
+  // "사건 목록", "사건 목록 조회", "사건 12 보여줘" 처럼 뒤에 말이 붙거나 오타가 있어도 조회로 본다 (짧은 글만)
   mode = 'incident';  // 사건 기록 조회 (agent DB, LLM 을 부르지 않는다)
 }} else if (!(ev.text ?? '').trim()) {{
   mode = 'reply';
