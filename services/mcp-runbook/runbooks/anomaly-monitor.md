@@ -5,7 +5,6 @@
 ## 증상
 
 - `AnomalyMonitorStale`: 탐지기(mcp-anomaly)가 5분 넘게 판정에 성공하지 못했다.
-- 이상 탐지가 새 판정(점수)을 내지 않는다. 예측 서버(추론 엔드포인트)가 응답하지 않거나 오류를 낸다.
 - 탐지기 로그에 `monitor failed: ... 500 Internal Server Error`.
 - 모델을 승격한 직후에 시작됐다면 새 모델과 예측 서버가 맞지 않는 것이다.
 
