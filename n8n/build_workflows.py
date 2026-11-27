@@ -752,13 +752,15 @@ mlops = workflow(W, "WF-04 mlops (재학습과 승격)", [
 #   act_restart     Deployment 재시작 (파드 템플릿에 restartedAt 어노테이션. Argo CD 가 관리하지 않는 필드라 되돌려지지 않는다)
 #   act_scale       replicas +1  ┐ Argo CD 가 selfHeal 이라 클러스터를 직접 바꾸면 되돌려진다
 #   act_rollback    마지막 변경 취소 ┘ → 배포 저장소에 커밋한다 (검사 → release → Argo CD)
-# 안전장치: operator 만, 대상은 허용 목록(DEPLOYS)만, 재시작은 5분에 한 번, 증설은 최대 4.
+# 안전장치: operator 만, 대상은 허용 목록(DEPLOYS)만, 1시간 넘은 보고서의 버튼은 거절, 재시작은 5분에 한 번, 증설은 최대 4,
+#   롤백은 마지막 변경이 이미 되돌리기면 거절.
 # 버튼 값(대상)을 바꿔 보내도 여기서 다시 검사하므로 다른 것을 건드릴 수 없다. 모델이 쓴 문장은 실행에 쓰이지 않는다.
 W = WF["actions"]
 DEPLOY_FILE = "https://api.github.com/repos/UHeeJoon/kube-chatops-deploy/contents/demo/__D__/deployment.yaml"
 DEPLOY_COMMITS = "https://api.github.com/repos/UHeeJoon/kube-chatops-deploy/commits?sha=main&per_page=2&path=demo/__D__/deployment.yaml"
 ACT_REQ = """
 const DEPLOYS = ['demo-app'];
+const MAX_AGE_MIN = 60;
 const ev = $json;
 const id = ev.action?.id ?? '';
 const [namespace, name] = String(ev.action?.value ?? '').split('/');
@@ -767,6 +769,8 @@ if (ev.role !== 'operator') { op = 'deny'; note = '조치 버튼은 operator 만
 else if (op === 'unknown') note = `모르는 조치입니다 (${id}).`;
 else if (op === 'delete_pod' && (namespace !== 'demo' || !/^[a-z0-9.-]{1,253}$/.test(name ?? ''))) { op = 'deny'; note = '대상이 올바르지 않습니다.'; }
 else if (op !== 'delete_pod' && (namespace !== 'demo' || !DEPLOYS.includes(name))) { op = 'deny'; note = `조치할 수 없는 대상입니다 (허용: ${DEPLOYS.map(d => 'demo/' + d).join(', ')}).`; }
+// 오래된 보고서의 버튼은 받지 않는다. 그 사이 상태가 바뀌었을 수 있다 (이미 되돌린 뒤 롤백을 또 누르면 되돌림이 취소된다).
+else if (op !== 'delete_pod' && !(Date.now() / 1000 - Number(ev.message_ts) < MAX_AGE_MIN * 60)) { op = 'deny'; note = `이 보고서는 ${MAX_AGE_MIN}분이 넘었습니다. 지금 상태가 달라졌을 수 있으니 다시 조사한 뒤 새 보고서에서 승인하세요.`; }
 return [{ json: { ...ev, op, namespace, pod: op === 'delete_pod' ? name : null, deploy: op !== 'delete_pod' && op !== 'deny' && op !== 'unknown' ? name : null, note } }];
 """
 ACT_CHECK = r"""
@@ -825,6 +829,8 @@ if (req.op === 'scale') {
   const prev = $json;
   const pick = $('직전 커밋').item.json;
   if (!pick.prev_sha) return refuse('이 파일의 이전 커밋이 없어 되돌릴 수 없습니다.');
+  // 마지막 변경이 이미 되돌리기면 또 되돌리지 않는다 (고장 난 상태로 돌아간다)
+  if (/롤백|되돌|revert/i.test(pick.last_title)) return refuse(`마지막 변경이 이미 되돌리기입니다 ("${pick.last_title}"). 또 되돌리면 그 전 상태로 돌아가므로 실행하지 않았습니다.`);
   if (prev.statusCode !== 200) return refuse(`이전 버전 파일 읽기 실패 (${prev.statusCode}).`);
   out = Buffer.from(prev.body.content, 'base64').toString('utf8');
   if (out === src) return refuse('직전 커밋과 내용이 같아 되돌릴 것이 없습니다.');
