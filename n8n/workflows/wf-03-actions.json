@@ -527,7 +527,7 @@
         620
       ],
       "parameters": {
-        "jsCode": "// 이 파일을 바꾼 최근 커밋 2개 중 두 번째(직전 상태)를 고른다.\nconst req = $('요청 정리').item.json;\nconst list = Array.isArray($json.body) ? $json.body : [];\nreturn [{ json: { ...req, prev_sha: list[1]?.sha ?? 'main' } }];"
+        "jsCode": "// 이 파일을 바꾼 최근 커밋 2개 중 두 번째(직전 상태)를 고른다.\nconst req = $('요청 정리').item.json;\nconst list = Array.isArray($json.body) ? $json.body : [];\nreturn [{ json: { ...req, prev_sha: list[1]?.sha ?? null, last_sha: String(list[0]?.sha ?? '').slice(0, 7),\n  last_title: String(list[0]?.commit?.message ?? '').split('\\n')[0].slice(0, 80) } }];"
       }
     },
     {
@@ -541,7 +541,7 @@
       ],
       "parameters": {
         "method": "GET",
-        "url": "={{ 'https://api.github.com/repos/UHeeJoon/kube-chatops-deploy/contents/demo/' + $json.deploy + '/deployment.yaml?ref=' + $json.prev_sha }}",
+        "url": "={{ 'https://api.github.com/repos/UHeeJoon/kube-chatops-deploy/contents/demo/' + $json.deploy + '/deployment.yaml?ref=' + ($json.prev_sha ?? 'main') }}",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -588,7 +588,7 @@
         700
       ],
       "parameters": {
-        "jsCode": "// 배포 저장소의 deployment.yaml 에서 한 줄만 바꾼다. 증설: replicas +1 (최대 4). 롤백: 이미지 digest 를 직전 커밋의 것으로.\nconst MAX_REPLICAS = 4;\nconst req = $('요청 정리').item.json;\nconst cur = $('현재 파일').item.json;\nconst refuse = note => [{ json: { ...req, ok: false, result: 'refused', note } }];\nif (cur.statusCode !== 200) return refuse(`배포 저장소 파일 읽기 실패 (${cur.statusCode}).`);\nconst src = Buffer.from(cur.body.content, 'base64').toString('utf8');\nlet out, what, message;\nif (req.op === 'scale') {\n  const m = src.match(/^(\\s*replicas: )(\\d+)\\s*$/m);\n  if (!m) return refuse('replicas 줄을 찾지 못했습니다.');\n  const n = Number(m[2]);\n  if (n >= MAX_REPLICAS) return refuse(`\\`${req.deploy}\\` 는 이미 replicas ${n} 입니다 (최대 ${MAX_REPLICAS}). 더 늘리지 않습니다.`);\n  out = src.replace(m[0], `${m[1]}${n + 1}`);\n  what = `replicas ${n} → ${n + 1}`;\n  message = `demo: ${req.deploy} replicas ${n} → ${n + 1} (Slack 승인 ${req.user_id})`;\n} else {\n  const re = new RegExp(`(image: ghcr\\\\.io/uheejoon/kube-chatops/${req.deploy}@)(sha256:[0-9a-f]{64})`);\n  const prev = $json;\n  if (prev.statusCode !== 200) return refuse(`이전 버전 파일 읽기 실패 (${prev.statusCode}).`);\n  const old = Buffer.from(prev.body.content, 'base64').toString('utf8');\n  const c = src.match(re), p = old.match(re);\n  if (!c || !p) return refuse('이미지 줄을 찾지 못했습니다.');\n  if (c[2] === p[2]) return refuse('이 파일의 직전 변경은 이미지 변경이 아니어서 되돌릴 이전 이미지가 없습니다. 배포 저장소 기록에서 직접 고르세요.');\n  out = src.replace(re, `$1${p[2]}`);\n  what = `이미지 ${c[2].slice(7, 19)} → ${p[2].slice(7, 19)}`;\n  message = `demo: ${req.deploy} 직전 이미지로 롤백 (Slack 승인 ${req.user_id})\\n\\n${c[2]} → ${p[2]}`;\n}\nreturn [{ json: { ...req, ok: true, what, put: { message, content: Buffer.from(out, 'utf8').toString('base64'), sha: cur.body.sha, branch: 'main' } } }];"
+        "jsCode": "// 배포 저장소의 deployment.yaml 에서 한 줄만 바꾼다. 증설: replicas +1 (최대 4). 롤백: 이미지 digest 를 직전 커밋의 것으로.\nconst MAX_REPLICAS = 4;\nconst req = $('요청 정리').item.json;\nconst cur = $('현재 파일').item.json;\nconst refuse = note => [{ json: { ...req, ok: false, result: 'refused', note } }];\nif (cur.statusCode !== 200) return refuse(`배포 저장소 파일 읽기 실패 (${cur.statusCode}).`);\nconst src = Buffer.from(cur.body.content, 'base64').toString('utf8');\nlet out, what, message;\nif (req.op === 'scale') {\n  const m = src.match(/^(\\s*replicas: )(\\d+)\\s*$/m);\n  if (!m) return refuse('replicas 줄을 찾지 못했습니다.');\n  const n = Number(m[2]);\n  if (n >= MAX_REPLICAS) return refuse(`\\`${req.deploy}\\` 는 이미 replicas ${n} 입니다 (최대 ${MAX_REPLICAS}). 더 늘리지 않습니다.`);\n  out = src.replace(m[0], `${m[1]}${n + 1}`);\n  what = `replicas ${n} → ${n + 1}`;\n  message = `demo: ${req.deploy} replicas ${n} → ${n + 1} (Slack 승인 ${req.user_id})`;\n} else {\n  // 롤백: 파일을 직전 커밋의 내용으로 되돌린다 (이미지든 설정이든 마지막 변경 하나를 취소). 무엇을 되돌리는지 커밋 제목을 보여 준다.\n  const prev = $json;\n  const pick = $('직전 커밋').item.json;\n  if (!pick.prev_sha) return refuse('이 파일의 이전 커밋이 없어 되돌릴 수 없습니다.');\n  if (prev.statusCode !== 200) return refuse(`이전 버전 파일 읽기 실패 (${prev.statusCode}).`);\n  out = Buffer.from(prev.body.content, 'base64').toString('utf8');\n  if (out === src) return refuse('직전 커밋과 내용이 같아 되돌릴 것이 없습니다.');\n  const re = /image: \\S+@sha256:([0-9a-f]{12})/;\n  const img = (src.match(re)?.[1] ?? '') !== (out.match(re)?.[1] ?? '') ? ` (이미지 ${src.match(re)?.[1]} → ${out.match(re)?.[1]})` : ' (이미지는 그대로, 설정 변경 취소)';\n  what = `마지막 변경 취소: \"${pick.last_title}\"${img}`;\n  message = `demo: ${req.deploy} 직전 상태로 롤백 (Slack 승인 ${req.user_id})\\n\\n되돌린 커밋 ${pick.last_sha}: ${pick.last_title}\\n되돌아간 상태 ${pick.prev_sha}`;\n}\nreturn [{ json: { ...req, ok: true, what, put: { message, content: Buffer.from(out, 'utf8').toString('base64'), sha: cur.body.sha, branch: 'main' } } }];"
       }
     },
     {

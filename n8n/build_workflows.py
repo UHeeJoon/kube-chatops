@@ -376,7 +376,7 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
   // 승인 버튼. 글자와 확인 창은 여기 고정 문구만 쓴다 (모델이 쓴 문장을 버튼에 넣지 않는다). 대상은 허용 목록에 있는 것만.
   const APPROVE = {
     restart: ['재시작 승인', '파드를 하나씩 다시 시작합니다 (rollout restart). 서비스는 유지됩니다. 메모리와 주입된 장애 상태가 초기화됩니다.'],
-    rollback: ['롤백 승인', '배포 저장소에서 이미지를 직전 버전으로 되돌리는 커밋을 올립니다. 검사 → Argo CD 반영까지 3~5분 걸립니다.'],
+    rollback: ['롤백 승인', '배포 저장소에서 이 Deployment 의 마지막 변경(이미지 또는 설정) 하나를 취소하는 커밋을 올립니다. 검사 → Argo CD 반영까지 3~5분 걸립니다.'],
     scale: ['증설 승인 (+1)', 'replicas 를 1 늘리는 커밋을 배포 저장소에 올립니다 (최대 4). 반영까지 3~5분 걸립니다.'],
   };
   const btns = [];
@@ -751,7 +751,7 @@ mlops = workflow(W, "WF-04 mlops (재학습과 승격)", [
 #   sec_delete_pod  격리 파드 삭제 (격리 라벨이 붙은 demo 파드만)
 #   act_restart     Deployment 재시작 (파드 템플릿에 restartedAt 어노테이션. Argo CD 가 관리하지 않는 필드라 되돌려지지 않는다)
 #   act_scale       replicas +1  ┐ Argo CD 가 selfHeal 이라 클러스터를 직접 바꾸면 되돌려진다
-#   act_rollback    직전 이미지로 ┘ → 배포 저장소에 커밋한다 (검사 → release → Argo CD)
+#   act_rollback    마지막 변경 취소 ┘ → 배포 저장소에 커밋한다 (검사 → release → Argo CD)
 # 안전장치: operator 만, 대상은 허용 목록(DEPLOYS)만, 재시작은 5분에 한 번, 증설은 최대 4.
 # 버튼 값(대상)을 바꿔 보내도 여기서 다시 검사하므로 다른 것을 건드릴 수 없다. 모델이 쓴 문장은 실행에 쓰이지 않는다.
 W = WF["actions"]
@@ -821,16 +821,17 @@ if (req.op === 'scale') {
   what = `replicas ${n} → ${n + 1}`;
   message = `demo: ${req.deploy} replicas ${n} → ${n + 1} (Slack 승인 ${req.user_id})`;
 } else {
-  const re = new RegExp(`(image: ghcr\\.io/uheejoon/kube-chatops/${req.deploy}@)(sha256:[0-9a-f]{64})`);
+  // 롤백: 파일을 직전 커밋의 내용으로 되돌린다 (이미지든 설정이든 마지막 변경 하나를 취소). 무엇을 되돌리는지 커밋 제목을 보여 준다.
   const prev = $json;
+  const pick = $('직전 커밋').item.json;
+  if (!pick.prev_sha) return refuse('이 파일의 이전 커밋이 없어 되돌릴 수 없습니다.');
   if (prev.statusCode !== 200) return refuse(`이전 버전 파일 읽기 실패 (${prev.statusCode}).`);
-  const old = Buffer.from(prev.body.content, 'base64').toString('utf8');
-  const c = src.match(re), p = old.match(re);
-  if (!c || !p) return refuse('이미지 줄을 찾지 못했습니다.');
-  if (c[2] === p[2]) return refuse('이 파일의 직전 변경은 이미지 변경이 아니어서 되돌릴 이전 이미지가 없습니다. 배포 저장소 기록에서 직접 고르세요.');
-  out = src.replace(re, `$1${p[2]}`);
-  what = `이미지 ${c[2].slice(7, 19)} → ${p[2].slice(7, 19)}`;
-  message = `demo: ${req.deploy} 직전 이미지로 롤백 (Slack 승인 ${req.user_id})\n\n${c[2]} → ${p[2]}`;
+  out = Buffer.from(prev.body.content, 'base64').toString('utf8');
+  if (out === src) return refuse('직전 커밋과 내용이 같아 되돌릴 것이 없습니다.');
+  const re = /image: \S+@sha256:([0-9a-f]{12})/;
+  const img = (src.match(re)?.[1] ?? '') !== (out.match(re)?.[1] ?? '') ? ` (이미지 ${src.match(re)?.[1]} → ${out.match(re)?.[1]})` : ' (이미지는 그대로, 설정 변경 취소)';
+  what = `마지막 변경 취소: "${pick.last_title}"${img}`;
+  message = `demo: ${req.deploy} 직전 상태로 롤백 (Slack 승인 ${req.user_id})\n\n되돌린 커밋 ${pick.last_sha}: ${pick.last_title}\n되돌아간 상태 ${pick.prev_sha}`;
 }
 return [{ json: { ...req, ok: true, what, put: { message, content: Buffer.from(out, 'utf8').toString('base64'), sha: cur.body.sha, branch: 'main' } } }];
 """
@@ -838,7 +839,8 @@ PREV_REF = r"""
 // 이 파일을 바꾼 최근 커밋 2개 중 두 번째(직전 상태)를 고른다.
 const req = $('요청 정리').item.json;
 const list = Array.isArray($json.body) ? $json.body : [];
-return [{ json: { ...req, prev_sha: list[1]?.sha ?? 'main' } }];
+return [{ json: { ...req, prev_sha: list[1]?.sha ?? null, last_sha: String(list[0]?.sha ?? '').slice(0, 7),
+  last_title: String(list[0]?.commit?.message ?? '').split('\n')[0].slice(0, 80) } }];
 """
 GIT_DONE = r"""
 const req = $('파일 고치기').item.json;
@@ -899,7 +901,7 @@ actions = workflow(W, "WF-03 actions (승인 조치)", [
     http(W, "최근 커밋", (1540, 620), "GET",
          "={{ '" + DEPLOY_COMMITS.replace("__D__", "' + $('요청 정리').item.json.deploy + '") + "' }}", None, "github", headers=GH),
     code(W, "직전 커밋", (1760, 620), PREV_REF),
-    http(W, "이전 파일", (1980, 620), "GET", _FILE("$json.prev_sha"), None, "github", headers=GH),
+    http(W, "이전 파일", (1980, 620), "GET", _FILE("($json.prev_sha ?? 'main')"), None, "github", headers=GH),
     code(W, "파일 고치기", (2200, 700), GIT_EDIT),
     if_true(W, "커밋할 것?", (2420, 700), "={{ $json.ok }}"),
     http(W, "커밋", (2640, 640), "PUT",
