@@ -56,6 +56,7 @@ def extract(days: float, prefix: str) -> str:
         "rows": len(df),
         "anomaly_minutes": int(df["label"].sum()),
         "ambiguous_minutes": int(df["ambiguous"].sum()),
+        "unlabeled_incident_minutes": int(df["unlabeled_incident"].sum()),
         "start": str(df["ts"].min()),
         "end": str(df["ts"].max()),
         "kinds": df.loc[df["label"] == 1, "kind"].value_counts().to_dict(),
@@ -68,13 +69,21 @@ def extract(days: float, prefix: str) -> str:
 # ── train ──
 
 
+def usable(df: pd.DataFrame) -> pd.DataFrame:
+    """정답을 믿을 수 있는 분만: 애매 구간(주입을 켜고 끈 직후)과 주입 표시 없는 장애 구간을 뺀다."""
+    drop = df["ambiguous"].astype(bool)
+    if "unlabeled_incident" in df:  # 11-28 이전에 만든 데이터에는 없다
+        drop = drop | df["unlabeled_incident"].astype(bool)
+    return df[~drop]
+
+
 def split(df: pd.DataFrame, train_frac: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     """정상 구간 앞쪽 train_frac 로 학습, 나머지(정상 뒤쪽 + 모든 장애 구간)로 평가.
 
     IsolationForest 는 정답을 쓰지 않는 모델이라 장애 구간은 학습에 넣지 않고 전부 평가에 쓴다.
     시간 순으로 자르므로 평가 데이터가 학습 데이터보다 미래다.
     """
-    df = df[~df["ambiguous"]].sort_values("ts").reset_index(drop=True)
+    df = usable(df).sort_values("ts").reset_index(drop=True)
     normal = df[df["label"] == 0]
     if len(normal) < 60:
         raise SystemExit(f"정상 구간이 너무 짧다 ({len(normal)}분)")
@@ -132,6 +141,7 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
                 "train_rows": len(train_df),
                 "test_rows": len(test_df),
                 "test_anomaly_rows": int(test_df["label"].sum()),
+                "unlabeled_incident_rows": int(df["unlabeled_incident"].sum()) if "unlabeled_incident" in df else 0,
                 "data_start": str(df["ts"].min()),
                 "data_end": str(df["ts"].max()),
                 "dataset": f"s3://{data.bucket()}/{dataset_key}",
@@ -139,7 +149,7 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         )
         mlflow.log_metric("threshold", bundle["threshold"])
         mlflow.log_metric("rps_low", bundle["rps_low"])
-        normal_all = df[(df["label"] == 0) & ~df["ambiguous"]]
+        normal_all = usable(df)[lambda d: d["label"] == 0]
         cv = cv_false_alarms(normal_all, quantile, z_limit)
         mlflow.log_metrics(cv)
         print(json.dumps(cv))
@@ -212,6 +222,34 @@ def false_alarms(y: pd.Series, pred: pd.Series, minute: np.ndarray | None) -> di
     }
 
 
+def episodes(test: pd.DataFrame, pred: pd.Series, minute: np.ndarray | None) -> dict:
+    """장애를 건(연속된 분)으로 센다: 몇 건 중 몇 건을 잡았나, 잡기까지 몇 분 걸렸나.
+
+    분 단위 재현율은 긴 장애 하나가 점수를 좌우한다. 운영에서 중요한 것은 "장애를 놓치지 않았나" 와 "얼마나 빨리" 다.
+    평가 데이터는 장애 시작 뒤 애매 구간(AMBIGUOUS_MINUTES 분)이 빠져 있으므로, 지연은 "애매 구간이 끝난 뒤 몇 분 더" 다
+    (0 이면 장애 시작 약 3분 안에 잡은 것). 같은 종류의 장애가 5분 넘게 끊기면 다른 건으로 본다.
+    """
+    if minute is None or not len(test):
+        return {}
+    frame = pd.DataFrame({"minute": minute, "kind": test["kind"].astype(str).to_numpy(), "label": test["label"].to_numpy(),
+                          "pred": pred.astype(bool).to_numpy()})
+    frame = frame[frame["label"] == 1].sort_values("minute")
+    found: list[tuple[str, bool, float | None]] = []
+    for kind, rows in frame.groupby("kind"):
+        group = (rows["minute"].diff() > 5).cumsum()
+        for _, ep in rows.groupby(group):
+            hit = ep.loc[ep["pred"], "minute"]
+            found.append((kind, len(hit) > 0, float(hit.iloc[0] - ep["minute"].iloc[0]) if len(hit) else None))
+    if not found:
+        return {}
+    delays = [d for _, ok, d in found if ok]
+    out = {"episodes": len(found), "episodes_detected": sum(ok for _, ok, _ in found),
+           "episodes_missed_kinds": ",".join(sorted({k for k, ok, _ in found if not ok}))}
+    if delays:
+        out |= {"detect_late_minutes_median": float(np.median(delays)), "detect_late_minutes_max": float(max(delays))}
+    return out
+
+
 def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     client = MlflowClient()
     model_id = client.get_run(run_id).data.tags["model_id"]
@@ -228,6 +266,7 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
         mask = test["kind"].astype(str).str.contains(kind)
         by_kind[f"recall_{kind}"] = round(float(scored.loc[mask, "is_anomaly"].mean()), 4)
     fa = false_alarms(y, scored["is_anomaly"], minute)
+    eps = episodes(test, scored["is_anomaly"], minute)
 
     # 지금 champion 이 있으면 같은 평가 데이터로 비교한다 (나빠지는 모델은 올리지 않는다)
     champion_f1 = None
@@ -258,13 +297,14 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
         **fa,
         "champion_false_alarm_minutes": champion_fa,
         **by_kind,
+        **eps,
         "passed": passed,
     }
     with mlflow.start_run(run_id=run_id):
         mlflow.log_metrics({f"test_{k}": v for k, v in model_m.items()})
         mlflow.log_metrics({f"baseline_{k}": v for k, v in base_m.items()})
         mlflow.log_metrics({f"iforest_{k}": v for k, v in iforest_m.items()})
-        mlflow.log_metrics({**fa, **by_kind})
+        mlflow.log_metrics({**fa, **by_kind, **{k: v for k, v in eps.items() if not isinstance(v, str)}})
         if champion_fa is not None:
             mlflow.log_metric("champion_false_alarm_minutes", champion_fa)
         if champion_f1 is not None:
@@ -331,6 +371,10 @@ def summary(workflow: str) -> dict:
             "cv_false_alarm_minutes": m.get("cv_false_alarm_minutes"),
             "cv_false_alarm_events": m.get("cv_false_alarm_events"),
             "cv_normal_days": m.get("cv_normal_days"),
+            "episodes": m.get("episodes"),
+            "episodes_detected": m.get("episodes_detected"),
+            "detect_late_minutes_median": m.get("detect_late_minutes_median"),
+            "detect_late_minutes_max": m.get("detect_late_minutes_max"),
             "recall_by_kind": {k.removeprefix("recall_"): v for k, v in m.items() if k.startswith("recall_")},
             "data": {k: p.get(k) for k in ("data_start", "data_end", "train_rows", "test_rows", "test_anomaly_rows")},
         }

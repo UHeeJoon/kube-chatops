@@ -42,6 +42,13 @@ FEATURE_QUERIES = {
 # 장애 주입을 켜면 1, 끄면 0. demo-app: kind = latency | error | leak, load-gen: kind = traffic_drop (요청 급감)
 LABEL_QUERY = 'max by (kind) (demo_chaos_active{namespace="demo"})'
 
+# 장애 주입 표시가 없는데 운영 알림이 울리던 분 (실제 장애, 잘못된 배포, 격리된 파드의 재시작 반복).
+# 정답을 모르는 구간이다. 정상으로 두면 그 값이 "평소" 로 학습되고, 평가에서는 맞게 잡은 것이 오탐으로 세어진다
+# (11-27 19:34 메모리 급증 14분: 실제 문제였는데 주입 표시가 없어 오탐으로 집계됐다).
+# 모델이 보는 지표(지연, 오류율, 메모리)에 대한 알림만 쓴다. 파드 재시작·보안 알림은 서비스 지표가 멀쩡한 채로 오래 울릴 수 있어
+# (격리된 파드 하나가 144분 재시작을 반복하는 동안 지표는 정상이었다) 넣으면 정상 데이터만 잃는다.
+INCIDENT_QUERY = 'max(ALERTS{namespace="demo", alertstate="firing", alertname=~"DemoHighLatency|DemoHighErrorRate|DemoMemoryNearLimit"})'
+
 STEP_SECONDS = 60
 CHUNK = timedelta(hours=12)  # query_range 는 시계열당 11,000 점까지라 나눠서 읽는다
 # rate(...[2m]) 는 장애를 켜고 끈 뒤 2분 정도 늦게 따라온다. 그 구간은 정답이 애매해 학습·평가에서 뺀다.
@@ -108,6 +115,19 @@ def fetch_labels(start: datetime, end: datetime, index: pd.Index) -> pd.DataFram
     return out
 
 
+def fetch_incident_minutes(start: datetime, end: datetime, index: pd.Index) -> pd.Series:
+    """운영 알림이 울리던 분 (앞뒤 AMBIGUOUS_MINUTES 분 포함: 알림은 `for` 만큼 늦게 켜지고 꺼진다)."""
+    with httpx.Client(timeout=60) as c:
+        firing = _to_series(_query_range(c, INCIDENT_QUERY, start, end), "incident").reindex(index).fillna(0) > 0
+    return widen(firing, AMBIGUOUS_MINUTES)
+
+
+def widen(flags: pd.Series, minutes: int) -> pd.Series:
+    """True 인 분의 앞뒤 minutes 분도 True 로."""
+    window = 2 * minutes + 1
+    return flags.astype(int).rolling(window, center=True, min_periods=1).max() > 0
+
+
 def build_dataset(days: float) -> pd.DataFrame:
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start = end - timedelta(days=days)
@@ -116,6 +136,8 @@ def build_dataset(days: float) -> pd.DataFrame:
     raw = raw[raw["rps"].notna()]
     labels = fetch_labels(start, end, raw.index)
     df = raw.join(labels)
+    # 주입 표시가 없는데 알림이 울리던 분: 정답을 모른다 → 학습에도 평가에도 쓰지 않는다
+    df["unlabeled_incident"] = (fetch_incident_minutes(start, end, raw.index) & (df["label"] == 0) & ~df["ambiguous"]).values
     # 정답이 없는 분을 정상으로 두면, 그때 넣은 장애가 "정상" 으로 학습된다 (11-25 실제로 겪음)
     return df[df.pop("labeled")].reset_index()
 

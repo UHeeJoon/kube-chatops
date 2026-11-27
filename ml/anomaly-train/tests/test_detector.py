@@ -226,3 +226,43 @@ def test_older_model_with_fewer_features_still_scores():
     del v5["features"]  # v5 번들에는 특성 목록이 없다
     out = score_frame(v5, test[RAW_COLUMNS])
     assert len(out) == len(test) and "z_mem_growth" not in out.columns
+
+
+def test_unlabeled_incident_minutes_are_not_used():
+    df = synthetic()
+    df["unlabeled_incident"] = False
+    # 주입 표시 없이 메모리가 치솟은 20분 (실제 장애). 정상으로 두면 평소 값이 오염된다
+    df.loc[100:119, "mem_ratio"] = 0.9
+    df.loc[100:119, "unlabeled_incident"] = True
+    train, test = steps.split(df, 0.7)
+    assert train["mem_ratio"].max() < 0.2 and test["mem_ratio"].max() < 0.2
+    assert len(steps.usable(df)) == len(df) - 20
+
+
+def test_usable_accepts_datasets_without_the_column():
+    df = synthetic()
+    df.loc[5:7, "ambiguous"] = True
+    assert len(steps.usable(df)) == len(df) - 3
+
+
+def test_widen_marks_neighbouring_minutes():
+    from anomaly.data import widen
+
+    flags = pd.Series([False] * 10)
+    flags[5] = True
+    assert widen(flags, 2).tolist() == [False, False, False, True, True, True, True, True, False, False]
+
+
+def test_episodes_count_incidents_and_delay():
+    df = synthetic()
+    _, test = steps.split(df, 0.7)
+    minute = steps.minute_numbers(test)
+    pred = pd.Series(False, index=test.index)
+    latency = test.index[test["kind"] == "latency"]
+    pred[latency[4:]] = True  # 지연 장애는 4분 늦게 잡고, 오류 장애는 놓친다
+    out = steps.episodes(test, pred, minute)
+    assert out["episodes"] == 2 and out["episodes_detected"] == 1 and out["episodes_missed_kinds"] == "error"
+    assert out["detect_late_minutes_median"] == 4.0
+    scored = score_frame(steps.fit_bundle(steps.split(df, 0.7)[0], 0.999, 4.0), test[RAW_COLUMNS], minute)
+    real = steps.episodes(test, scored["is_anomaly"], minute)
+    assert real["episodes_detected"] == 2 and real["detect_late_minutes_max"] == 0.0

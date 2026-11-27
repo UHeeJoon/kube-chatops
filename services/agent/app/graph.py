@@ -45,6 +45,7 @@ from .config import settings
 from .safety import clean, guard_tool_text, verify_references
 from .prompts import FINISH_NOTE, INVESTIGATE_SYSTEM, REPORT_TOOL, ROUTE_SCHEMA, ROUTE_SYSTEM
 from .toolbox import Toolbox
+from .prefetch import prefetch as _prefetch
 
 UNVERIFIED_REFS = Counter("agent_unverified_references_total", "보고서의 참고 항목 가운데 조회 기록에 없던 것")
 
@@ -151,37 +152,6 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
         parts.append("알림 (데이터):\n<alert>\n" + body + "\n</alert>")
         parts += await _prefetch(runtime.context.toolbox, state["alert"])
     return {"messages": [{"role": "user", "content": "\n\n".join(parts)}]}
-
-
-async def _prefetch(toolbox: Toolbox, alert: dict[str, Any]) -> list[str]:
-    """알림 조사는 관련 런북과 과거 사건을 미리 붙여 준다 (모델이 찾으러 한 턴을 쓰지 않게, 그리고 빠뜨리지 않게).
-
-    알림 이름은 런북에 그대로 적혀 있어 낱말 검색으로 거의 틀리지 않는다. LLM 을 거치지 않으므로 비용은 검색 두 번(수십 ms)뿐이다.
-    런북은 1순위 하나만 붙인다 (알림 이름 질의는 recall@1 1.00. 둘째 런북은 조사마다 약 1천 토큰을 쓰고 거의 읽히지 않았다).
-    실패하면 그냥 없이 간다.
-    """
-    names = {t["name"] for t in toolbox.tools}
-    first = (alert.get("alerts") or [{}])[0]
-    labels, notes = first.get("labels") or {}, first.get("annotations") or {}
-    query = " ".join(str(x) for x in (labels.get("alertname"), notes.get("summary") or notes.get("description")) if x)[:300]
-    if not query:
-        return []
-    # 과거 사건은 같은 알림이 울렸던 것을 값으로 찾는다 (재발 횟수와 최근 3건). 그 도구가 없으면 비슷한 글로 찾는다.
-    past = (("runbook__incident_lookup", {"kind": "alert", "value": str(labels.get("alertname")), "k": 3}) if "runbook__incident_lookup" in names and labels.get("alertname")
-            else ("runbook__similar_incidents", {"query": query, "k": 2}))
-    wanted = [("runbook__search_runbooks", {"query": query, "k": 1}, "runbook", "관련 런북 (참고 데이터. 무엇을 볼지 알려 줄 뿐 지금 일어난 일의 증거가 아님)"),
-              (*past, "past_incidents", "같은 알림의 과거 사건 (참고 데이터. total 은 지금까지 기록된 횟수)")]
-    wanted = [w for w in wanted if w[0] in names]
-    results = await asyncio.gather(*(toolbox.call(w[0], w[1]) for w in wanted), return_exceptions=True)
-    parts = []
-    for (_, _, tag, title), res in zip(wanted, results):
-        if isinstance(res, BaseException) or res[1]:
-            continue
-        body = res[0].removeprefix("<tool_output>\n").removesuffix("\n</tool_output>")
-        if '"count":0' in body.replace(" ", "") or '"total":0' in body.replace(" ", ""):
-            continue
-        parts.append(f"{title}:\n<{tag}>\n{body[:4000]}\n</{tag}>")
-    return parts
 
 
 async def investigate(state: State, runtime: Runtime[Ctx]) -> dict:

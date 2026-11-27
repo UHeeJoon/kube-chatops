@@ -40,6 +40,10 @@ jobs:
       - name: 이상 탐지 모델 단위 테스트 (합성 데이터)
         working-directory: ml/anomaly-train
         run: python -m pytest -q tests
+      - run: pip install -r ml/anomaly-serve/requirements.txt
+      - name: 서빙 계약 시험 (학습이 만든 모델 → 서빙 코드 → mcp-anomaly 요청 모양)
+        working-directory: ml/anomaly-serve
+        run: python -m pytest -q tests
 
   # MCP 서버의 조회 범위 시험: 모든 도구가 허용 네임스페이스 밖을 거절하는지 (백엔드 없이).
   # 새 도구를 추가하면 namespace 를 받아 검사하거나, tests/test_scope.py 의 UNSCOPED 에 이유를 적어야 통과한다.
