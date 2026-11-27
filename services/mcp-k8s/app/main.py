@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 
 from kubernetes import client, config
@@ -28,6 +29,17 @@ server = MCPServer(
     name="mcp-k8s",
     instructions="쿠버네티스 리소스 상태 조회 (읽기 전용). 파드, 이벤트, Deployment, 롤아웃 이력.",
 )
+
+
+NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")  # 리소스 이름 (DNS subdomain)
+LABEL_SELECTOR = re.compile(r"[A-Za-z0-9_./-]{1,253}(=|==|!=)[A-Za-z0-9_.-]{0,63}(,[A-Za-z0-9_./-]{1,253}(=|==|!=)[A-Za-z0-9_.-]{0,63}){0,7}")
+
+
+def _name(value: str, what: str = "name") -> str:
+    """이름은 선택자 문자열에 들어간다. 쉼표나 = 가 섞이면 조건이 덧붙으므로 형식을 먼저 본다."""
+    if not NAME.fullmatch(value or ""):
+        raise ToolInputError(f"{what} 은 쿠버네티스 리소스 이름 형식이어야 합니다 (소문자, 숫자, -, .)")
+    return value
 
 
 def _age(ts: datetime | None) -> str | None:
@@ -65,7 +77,10 @@ async def get_pod_status(namespace: str = "demo", label_selector: str | None = N
 
     label_selector 예: app.kubernetes.io/name=demo-app
     """
-    pods = await _call(core.list_namespaced_pod, check_namespace(namespace), label_selector=label_selector or "", limit=50)
+    ns = check_namespace(namespace)  # 범위 검사가 먼저 (다른 입력 검사나 API 호출보다 앞)
+    if label_selector and not LABEL_SELECTOR.fullmatch(label_selector):
+        raise ToolInputError("label_selector 는 key=value 를 쉼표로 이은 형식이어야 합니다 (예: app.kubernetes.io/name=demo-app)")
+    pods = await _call(core.list_namespaced_pod, ns, label_selector=label_selector or "", limit=50)
     items = [
         {
             "name": p.metadata.name,
@@ -84,10 +99,11 @@ async def get_pod_status(namespace: str = "demo", label_selector: str | None = N
 @instrumented
 async def get_events(namespace: str = "demo", minutes: int = 60, object_name: str | None = None, warnings_only: bool = False) -> str:
     """최근 `minutes` 분(최대 1440) 의 이벤트를 최신순으로 최대 50개. object_name 으로 특정 리소스만 볼 수 있다."""
+    ns = check_namespace(namespace)
     if not 1 <= minutes <= 1440:
         raise ToolInputError("minutes 는 1~1440 사이여야 합니다")
-    selector = f"involvedObject.name={object_name}" if object_name else ""
-    events = await _call(core.list_namespaced_event, check_namespace(namespace), field_selector=selector)
+    selector = f"involvedObject.name={_name(object_name, 'object_name')}" if object_name else ""
+    events = await _call(core.list_namespaced_event, ns, field_selector=selector)
     since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
     rows = []
     for e in events.items:
@@ -112,7 +128,8 @@ async def get_events(namespace: str = "demo", minutes: int = 60, object_name: st
 @instrumented
 async def describe_deployment(name: str, namespace: str = "demo") -> str:
     """Deployment 의 원하는 상태와 실제 상태, 컨테이너 이미지와 리소스, 프로브, 상태 조건."""
-    d = await _call(apps.read_namespaced_deployment, name, check_namespace(namespace))
+    ns, name = check_namespace(namespace), _name(name)
+    d = await _call(apps.read_namespaced_deployment, name, ns)
     containers = []
     for c in d.spec.template.spec.containers:
         res = c.resources
@@ -145,7 +162,7 @@ async def describe_deployment(name: str, namespace: str = "demo") -> str:
 @instrumented
 async def rollout_history(name: str, namespace: str = "demo") -> str:
     """Deployment 의 롤아웃 이력 (ReplicaSet 리비전별 이미지, 생성 시각, 현재 복제본 수). 최근 배포가 장애와 겹치는지 볼 때 쓴다."""
-    ns = check_namespace(namespace)
+    ns, name = check_namespace(namespace), _name(name)
     d = await _call(apps.read_namespaced_deployment, name, ns)
     selector = ",".join(f"{k}={v}" for k, v in (d.spec.selector.match_labels or {}).items())
     rss = await _call(apps.list_namespaced_replica_set, ns, label_selector=selector)

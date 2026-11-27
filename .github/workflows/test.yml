@@ -1,4 +1,4 @@
-# Python 서비스 문법 검사와 비밀 값 검사. 서비스별 단위 테스트는 생기는 대로 추가한다.
+# Python 서비스 문법 검사, 비밀 값 검사, MCP 서버 조회 범위 시험. 서비스별 단위 테스트는 생기는 대로 추가한다.
 name: test
 on:
   push:
@@ -40,3 +40,26 @@ jobs:
       - name: 이상 탐지 모델 단위 테스트 (합성 데이터)
         working-directory: ml/anomaly-train
         run: python -m pytest -q tests
+
+  # MCP 서버의 조회 범위 시험: 모든 도구가 허용 네임스페이스 밖을 거절하는지 (백엔드 없이).
+  # 새 도구를 추가하면 namespace 를 받아 검사하거나, tests/test_scope.py 의 UNSCOPED 에 이유를 적어야 통과한다.
+  mcp-scope:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [mcp-k8s, mcp-loki, mcp-prometheus]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements.txt
+      - run: pip install -r services/${{ matrix.service }}/requirements.txt pytest
+      - name: 범위 시험
+        working-directory: services/${{ matrix.service }}
+        env:
+          PYTHONPATH: ../mcp-common:.
+        run: python -m pytest -q tests
+
