@@ -163,3 +163,41 @@ def put_frame(df: pd.DataFrame, key: str) -> str:
 def get_frame(key: str) -> pd.DataFrame:
     body = _s3().get_object(Bucket=bucket(), Key=key)["Body"].read()
     return pd.read_parquet(io.BytesIO(body))
+
+
+# ── 쌓아 두는 데이터. Prometheus 는 7일만 보관하므로, 추출할 때마다 하루 단위로 MinIO 에 남겨 그 너머를 쓴다. ──
+
+HISTORY_PREFIX = "history"
+
+
+def merge_day(existing: pd.DataFrame | None, fresh: pd.DataFrame) -> pd.DataFrame:
+    """같은 날의 이전 저장분과 새로 읽은 것을 합친다. 같은 분은 새로 읽은 것을 쓴다 (정답 계산이 나아졌을 수 있다)."""
+    if existing is None or existing.empty:
+        return fresh.sort_values("ts").reset_index(drop=True)
+    keep = existing[~existing["ts"].isin(fresh["ts"])]
+    return pd.concat([keep, fresh]).sort_values("ts").reset_index(drop=True)
+
+
+def _day_key(day: str) -> str:
+    return f"{HISTORY_PREFIX}/day={day}.parquet"
+
+
+def _history_days() -> list[str]:
+    days: list[str] = []
+    for page in _s3().get_paginator("list_objects_v2").paginate(Bucket=bucket(), Prefix=f"{HISTORY_PREFIX}/day="):
+        days += [o["Key"].removeprefix(f"{HISTORY_PREFIX}/day=").removesuffix(".parquet") for o in page.get("Contents", [])]
+    return sorted(days)
+
+
+def accumulate(fresh: pd.DataFrame, keep_days: int) -> pd.DataFrame:
+    """새로 읽은 데이터를 날짜별로 저장하고, 최근 keep_days 일의 쌓인 데이터를 돌려준다."""
+    stored = set(_history_days())
+    by_day = fresh.groupby(pd.to_datetime(fresh["ts"], utc=True).dt.strftime("%Y-%m-%d"))
+    for day, rows in by_day:
+        put_frame(merge_day(get_frame(_day_key(day)) if day in stored else None, rows), _day_key(day))
+    oldest = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    days = [d for d in sorted(stored | set(by_day.groups)) if d >= oldest]
+    out = pd.concat([get_frame(_day_key(d)) for d in days]).sort_values("ts").reset_index(drop=True)
+    if "unlabeled_incident" in out:  # 이 열이 생기기 전에 쌓인 날
+        out["unlabeled_incident"] = out["unlabeled_incident"].fillna(False).astype(bool)
+    return out

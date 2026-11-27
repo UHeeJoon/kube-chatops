@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 
@@ -34,10 +35,66 @@ async def prefetch(toolbox: Any, alert: dict[str, Any]) -> list[str]:
         body = _unwrap(res[0])
         if '"count":0' in body.replace(" ", "") or '"total":0' in body.replace(" ", ""):
             continue
+        checks: list[tuple[str, dict]] = []
         if tag == "runbook":
             body = await _whole_runbook(toolbox, body, names)
+            body, checks = split_checks(body, names)
         parts.append(f"{title}:\n<{tag}>\n{body[:4000]}\n</{tag}>")
+        if checks:
+            parts.append(await _run_checks(toolbox, checks))
     return parts
+
+
+CHECKS_BLOCK = re.compile(r"\n?[^\n]*미리 실행하는 조회[^\n]*\n+```checks\n(.*?)```\n?", re.S)
+MAX_CHECKS = 5
+CHECK_RESULT_CHARS = 1500
+
+
+def parse_checks(text: str) -> list[tuple[str, dict]]:
+    """```checks 블록의 줄들 → [(도구 이름, 인자)]. 형식이 틀린 줄은 버린다."""
+    out: list[tuple[str, dict]] = []
+    for line in text.splitlines():
+        tool, _, raw = line.strip().partition(" ")
+        if not tool:
+            continue
+        try:
+            args = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            continue
+        if isinstance(args, dict):
+            out.append((tool, args))
+    return out
+
+
+def split_checks(body: str, names: set[str]) -> tuple[str, list[tuple[str, dict]]]:
+    """런북 글에서 '미리 실행하는 조회' 블록을 떼어 낸다 → (블록을 뺀 글, 실행할 조회).
+
+    런북은 사람이 검토해 Git 으로 들어온 글이고 서명된 이미지에서만 읽으므로 실행 목록의 출처로 쓴다 (사건 기록에서는 읽지 않는다).
+    그래도 실행은 이 에이전트가 가진 조회 도구로만, MAX_CHECKS 개까지만 한다. 런북·사건 검색 도구는 여기서 부르지 않는다.
+    body 는 JSON 문자열(content 안에 줄바꿈이 \\n 으로 들어 있음)이라 풀어서 찾고, 뺀 글로 다시 만든다.
+    """
+    try:
+        start = body.index("{")
+        doc = json.loads(body[start: body.rindex("}") + 1])
+        content = doc["content"]
+    except (ValueError, KeyError, TypeError):
+        return body, []
+    found = CHECKS_BLOCK.search(content)
+    if not found:
+        return body, []
+    checks = [(t, a) for t, a in parse_checks(found.group(1)) if t in names and not t.startswith("runbook__")][:MAX_CHECKS]
+    doc["content"] = content[: found.start()] + "\n" + content[found.end():]
+    return body[:start] + json.dumps(doc, ensure_ascii=False), checks
+
+
+async def _run_checks(toolbox: Any, checks: list[tuple[str, dict]]) -> str:
+    results = await asyncio.gather(*(toolbox.call(t, a) for t, a in checks), return_exceptions=True)
+    rows = []
+    for (tool, args), res in zip(checks, results):
+        text = f"조회 실패: {type(res).__name__}" if isinstance(res, BaseException) else _unwrap(res[0])[:CHECK_RESULT_CHARS]
+        rows.append(f"[{tool} {json.dumps(args, ensure_ascii=False)}]\n{text}")
+    return ("런북의 확인 항목을 방금 실행한 결과 (지금 상태의 조회 결과. 같은 조회를 다시 부르지 않습니다):\n<checks>\n"
+            + "\n\n".join(rows) + "\n</checks>")
 
 
 def _unwrap(text: str) -> str:

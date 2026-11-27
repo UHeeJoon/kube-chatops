@@ -16,6 +16,16 @@
 - 시작 시각과 최근 배포 시각이 겹치는지 (rollout 이력).
 - 주입 여부: `demo_chaos_active{kind="error"}`.
 
+에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):
+
+```checks
+prometheus__query_range {"query": "sum(rate(http_requests_total{namespace=\"demo\", status=~\"5..\"}[2m])) / sum(rate(http_requests_total{namespace=\"demo\"}[2m]))", "minutes": 30}
+prometheus__query_instant {"query": "sum by (path, pod) (rate(http_requests_total{namespace=\"demo\", status=~\"5..\"}[2m]))"}
+loki__error_summary {"namespace": "demo", "minutes": 15}
+prometheus__query_instant {"query": "demo_chaos_active{namespace=\"demo\"}"}
+k8s__rollout_history {"name": "demo-app", "namespace": "demo"}
+```
+
 ## 원인 후보
 
 - 잘못된 배포 (코드 오류, 잘못된 환경 변수).

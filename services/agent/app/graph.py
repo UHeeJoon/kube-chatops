@@ -47,6 +47,7 @@ from .prompts import FINISH_NOTE, INVESTIGATE_SYSTEM, REPORT_TOOL, ROUTE_SCHEMA,
 from .toolbox import Toolbox
 from .prefetch import prefetch as _prefetch
 
+PREFETCH = Counter("agent_prefetch_total", "알림 조사의 선조회 결과 (런북을 붙였나, 확인 항목을 미리 실행했나)", ["alertname", "runbook", "checks"])
 UNVERIFIED_REFS = Counter("agent_unverified_references_total", "보고서의 참고 항목 가운데 조회 기록에 없던 것")
 
 tracer = trace.get_tracer("agent.graph")
@@ -150,7 +151,12 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
         # 알림 내용도 외부 입력이므로 데이터로 표시한다 (라벨·주석에 공격자가 만든 글이 들어올 수 있다: 요청 경로, 파드 이름)
         body, _ = guard_tool_text(json.dumps(state["alert"], ensure_ascii=False, sort_keys=True)[:4000])
         parts.append("알림 (데이터):\n<alert>\n" + body + "\n</alert>")
-        parts += await _prefetch(runtime.context.toolbox, state["alert"])
+        fetched = await _prefetch(runtime.context.toolbox, state["alert"])
+        # 런북 빈틈: 알림이 왔는데 붙일 런북이 없었다 (런북이 없는 알림이 무엇인지 지표로 본다)
+        name = str(((state["alert"].get("alerts") or [{}])[0].get("labels") or {}).get("alertname") or "unknown")[:60]
+        PREFETCH.labels(name, "runbook" if any("<runbook>" in p for p in fetched) else "none",
+                        "yes" if any("<checks>" in p for p in fetched) else "no").inc()
+        parts += fetched
     return {"messages": [{"role": "user", "content": "\n\n".join(parts)}]}
 
 

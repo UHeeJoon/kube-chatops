@@ -153,13 +153,16 @@ pub struct Related {
 }
 
 /// 같은 개체가 나온 사건을 최근 것부터. 전체 건수도 함께 (재발 횟수).
-pub async fn lookup(pool: &PgPool, kind: &str, value: &str, limit: i64) -> Result<(i64, Vec<Related>)> {
-    let total: i64 = sqlx::query("select count(*) from entities e join documents d on d.id = e.document_id where d.kind = 'incident' and e.kind = $1 and e.value = $2")
-        .bind(kind)
-        .bind(value)
-        .fetch_one(pool)
-        .await?
-        .get(0);
+pub async fn lookup(pool: &PgPool, kind: &str, value: &str, limit: i64) -> Result<(i64, Option<String>, Vec<Related>)> {
+    let stats = sqlx::query(
+        "select count(*), to_char(min(d.updated_at) at time zone 'Asia/Seoul', 'YYYY-MM-DD HH24:MI')
+         from entities e join documents d on d.id = e.document_id where d.kind = 'incident' and e.kind = $1 and e.value = $2",
+    )
+    .bind(kind)
+    .bind(value)
+    .fetch_one(pool)
+    .await?;
+    let (total, first): (i64, Option<String>) = (stats.get(0), stats.get(1));
     let rows = sqlx::query_as::<_, Related>(
         "select d.id as document_id, d.title, d.source, d.meta,
                 to_char(d.updated_at at time zone 'Asia/Seoul', 'YYYY-MM-DD HH24:MI') as recorded_at
@@ -172,7 +175,7 @@ pub async fn lookup(pool: &PgPool, kind: &str, value: &str, limit: i64) -> Resul
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    Ok((total, rows))
+    Ok((total, first, rows))
 }
 
 /// 폴더에서 사라진 런북을 지운다. 남길 source 목록을 받는다.

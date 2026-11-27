@@ -266,3 +266,26 @@ def test_episodes_count_incidents_and_delay():
     scored = score_frame(steps.fit_bundle(steps.split(df, 0.7)[0], 0.999, 4.0), test[RAW_COLUMNS], minute)
     real = steps.episodes(test, scored["is_anomaly"], minute)
     assert real["episodes_detected"] == 2 and real["detect_late_minutes_max"] == 0.0
+
+
+def test_merge_day_prefers_freshly_read_minutes():
+    from anomaly.data import merge_day
+
+    old = synthetic(10)
+    fresh = synthetic(10).iloc[5:].assign(label=1)
+    fresh = pd.concat([fresh, synthetic(12).iloc[10:]])
+    out = merge_day(old, fresh)
+    assert len(out) == 12 and out["ts"].is_monotonic_increasing
+    assert out["label"].tolist() == [0] * 5 + [1] * 5 + [0, 0]
+    assert len(merge_day(None, fresh)) == len(fresh)
+
+
+def test_compare_replay_separates_trouble_from_quiet():
+    df = synthetic(10)
+    df.loc[0:2, "label"] = 1
+    new = pd.Series([True, True, False, True, False, False, False, False, False, False])
+    old = pd.Series([True, False, True, False, False, False, False, False, False, True])
+    out = steps.compare_replay(df, new, old)
+    assert out["replay_only_new_in_trouble"] == 1 and out["replay_only_new_in_quiet"] == 1
+    assert out["replay_only_champion_in_trouble"] == 1 and out["replay_only_champion_in_quiet"] == 1
+    assert out["replay_minutes"] == 10 and out["replay_new_anomaly_minutes"] == 3

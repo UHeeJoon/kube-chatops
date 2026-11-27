@@ -15,6 +15,14 @@
 - 이미지: 이 프로젝트의 자체 이미지는 CI 가 digest 로 올린다. 사람이 태그를 직접 고쳤으면 그 커밋이 원인일 가능성이 높다.
 - 환경 변수·Secret: 새로 추가한 값이 없어서 시작하다 죽는 경우 (`환경 변수 X 가 없다` 같은 로그).
 
+에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):
+
+```checks
+k8s__get_pod_status {"namespace": "demo"}
+k8s__get_events {"namespace": "demo", "minutes": 30}
+k8s__rollout_history {"name": "demo-app", "namespace": "demo"}
+```
+
 ## 원인 후보
 
 - 없는 이미지 주소 또는 잘못된 digest.

@@ -1,6 +1,6 @@
 # 메모리 누수와 OOM 재시작 (demo-app)
 
-관련 알림: `DemoMemoryNearLimit`, `DemoPodRestarting`. 장애 시나리오 S1.
+관련 알림: `DemoMemoryNearLimit`, `DemoMemoryLeakSuspected`, `DemoPodRestarting`. 장애 시나리오 S1.
 
 ## 증상
 
@@ -10,10 +10,21 @@
 
 ## 확인
 
+- `DemoMemoryLeakSuspected` 는 이상 탐지 모델이 메모리 증가 속도를 평소보다 빠르다고 본 것이다 (분당 한도의 2% 이상이 5분). 아직 한도 80% 전이므로 지금 사용률과 기울기로 한도까지 남은 시간을 어림한다.
+
 - 메모리 추세: `container_memory_working_set_bytes{namespace="demo", container="app"}` 를 한도(`kube_pod_container_resource_limits`)로 나눈 값. 계단이 아니라 꾸준한 기울기면 누수다.
 - 재시작 이유: 파드의 마지막 종료 상태가 `OOMKilled` 인지 (`kubectl -n demo describe pod`, Last State).
 - 트래픽: `sum(rate(http_requests_total{namespace="demo"}[5m]))` 가 평소 수준인지. 트래픽이 늘어 메모리가 는 것이면 누수가 아니라 용량 문제다.
 - 주입 여부: `demo_chaos_active{kind="leak"}` 가 1 이면 시험으로 넣은 누수다.
+
+에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):
+
+```checks
+prometheus__query_range {"query": "max by (pod) (container_memory_working_set_bytes{namespace=\"demo\", container=\"app\"}) / max by (pod) (kube_pod_container_resource_limits{namespace=\"demo\", container=\"app\", resource=\"memory\"})", "minutes": 60}
+k8s__get_pod_status {"namespace": "demo", "label_selector": "app.kubernetes.io/name=demo-app"}
+prometheus__query_instant {"query": "sum(rate(http_requests_total{namespace=\"demo\"}[5m]))"}
+prometheus__query_instant {"query": "demo_chaos_active{namespace=\"demo\"}"}
+```
 
 ## 원인 후보
 

@@ -18,6 +18,14 @@
 - 다른 파드로 번졌나: 같은 워크로드의 다른 파드, 네트워크 흐름 알림(`DemoFlowPolicyDenied`, `DemoPortScan`).
 - 격리됐나: 파드에 `security.kube-chatops/quarantine=true` 라벨이 있는지.
 
+에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):
+
+```checks
+loki__security_events {"minutes": 30}
+loki__waf_blocks {"minutes": 30}
+k8s__get_pod_status {"namespace": "demo"}
+```
+
 ## 판단
 
 - 실행·쓰기 시도가 있었다는 것은 요청 단계 방어를 넘어 앱 안에서 코드가 돌았다는 뜻이다. 차단됐어도 그 파드는 침해된 것으로 본다.

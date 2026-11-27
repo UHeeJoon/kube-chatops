@@ -17,6 +17,7 @@ def main() -> None:
     e = sub.add_parser("extract", help="Prometheus → MinIO parquet")
     e.add_argument("--days", type=float, default=7.0)
     e.add_argument("--prefix", default=prefix_default)
+    e.add_argument("--history-days", type=int, default=28, help="MinIO 에 쌓아 둔 데이터를 최근 며칠까지 쓸지 (0 이면 쌓지 않음)")
 
     t = sub.add_parser("train", help="IsolationForest 학습 → MLflow run")
     t.add_argument("--dataset", required=True)
@@ -39,7 +40,7 @@ def main() -> None:
 
     a = p.parse_args()
     if a.step == "extract":
-        steps.extract(a.days, a.prefix)
+        steps.extract(a.days, a.prefix, a.history_days)
     elif a.step == "train":
         steps.train(a.dataset, a.prefix, a.train_frac, a.quantile, a.z_limit)
     elif a.step == "evaluate":

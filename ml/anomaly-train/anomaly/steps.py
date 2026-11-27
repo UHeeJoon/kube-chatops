@@ -47,13 +47,22 @@ def emit(name: str, value) -> None:
 # ── extract ──
 
 
-def extract(days: float, prefix: str) -> str:
+def extract(days: float, prefix: str, history_days: int = 28) -> str:
     df = data.build_dataset(days)
     if df.empty:
         raise SystemExit("데이터가 없다 (Prometheus 질의 결과 0행)")
+    fresh_rows = len(df)
+    if history_days > 0:
+        # Prometheus 보존 기간(7일) 너머의 데이터를 쓴다. 쌓기에 실패해도 이번 학습은 새로 읽은 것으로 진행한다.
+        try:
+            df = data.accumulate(df, history_days)
+            print(f"쌓인 데이터 {len(df)}행 (이번에 읽은 것 {fresh_rows}행)")
+        except Exception as e:  # noqa: BLE001
+            print(f"데이터 쌓기 실패, 이번에 읽은 것만 쓴다: {type(e).__name__}: {e}")
     key = data.put_frame(df, f"{prefix}/dataset.parquet")
     summary = {
         "rows": len(df),
+        "fresh_rows": fresh_rows,
         "anomaly_minutes": int(df["label"].sum()),
         "ambiguous_minutes": int(df["ambiguous"].sum()),
         "unlabeled_incident_minutes": int(df["unlabeled_incident"].sum()),
@@ -250,6 +259,41 @@ def episodes(test: pd.DataFrame, pred: pd.Series, minute: np.ndarray | None) -> 
     return out
 
 
+REPLAY_HOURS = 24
+
+
+def compare_replay(frame: pd.DataFrame, new: pd.Series, old: pd.Series) -> dict:
+    """같은 구간을 두 모델로 채점했을 때 판정이 갈린 분. frame 에는 label(주입), unlabeled_incident 가 있다.
+
+    갈린 분이 장애 중이었으면 그쪽 모델이 더 잡은 것이고, 아무 일도 없던 때였으면 그쪽 모델의 오탐 후보다.
+    """
+    new, old = new.astype(bool).to_numpy(), old.astype(bool).to_numpy()
+    trouble = (frame["label"].to_numpy() == 1) | frame["ambiguous"].to_numpy(dtype=bool) | frame.get("unlabeled_incident", pd.Series(False, index=frame.index)).to_numpy(dtype=bool)
+    only_new, only_old = new & ~old, old & ~new
+    return {
+        "replay_minutes": int(len(frame)),
+        "replay_new_anomaly_minutes": int(new.sum()),
+        "replay_champion_anomaly_minutes": int(old.sum()),
+        "replay_only_new_in_trouble": int((only_new & trouble).sum()),
+        "replay_only_new_in_quiet": int((only_new & ~trouble).sum()),
+        "replay_only_champion_in_trouble": int((only_old & trouble).sum()),
+        "replay_only_champion_in_quiet": int((only_old & ~trouble).sum()),
+    }
+
+
+def replay(new_bundle: dict, champion_bundle: dict) -> dict:
+    """최근 REPLAY_HOURS 시간의 실제 지표를 새 모델과 지금 서빙 모델로 다시 채점해 비교한다 (승격 전에 실제 트래픽에서의 차이를 본다).
+
+    평가 데이터는 학습 창의 뒤쪽 30% 와 장애 구간뿐이다. 여기서는 가장 최근 하루를 빠짐없이, 서빙과 같은 방식(연속된 분)으로 본다.
+    """
+    frame = data.build_dataset(REPLAY_HOURS / 24)
+    if frame.empty:
+        return {}
+    minute = minute_numbers(frame)
+    return compare_replay(frame, score_frame(new_bundle, frame[RAW_COLUMNS], minute)["is_anomaly"],
+                          score_frame(champion_bundle, frame[RAW_COLUMNS], minute)["is_anomaly"])
+
+
 def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     client = MlflowClient()
     model_id = client.get_run(run_id).data.tags["model_id"]
@@ -257,7 +301,8 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     y = test["label"]
 
     minute = minute_numbers(test)
-    scored = score_frame(_bundle_of(f"models:/{model_id}"), test[RAW_COLUMNS], minute)
+    new_bundle = _bundle_of(f"models:/{model_id}")
+    scored = score_frame(new_bundle, test[RAW_COLUMNS], minute)
     model_m = _metrics(y, scored["is_anomaly"])
     base_m = _metrics(y, scored["zscore_anomaly"])  # 기준선: 특성별 z-score 만
     iforest_m = _metrics(y, scored["iforest_anomaly"])  # 참고: IsolationForest 만
@@ -273,12 +318,20 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     champion_fa = None
     try:
         champ = client.get_model_version_by_alias(MODEL_NAME, "champion")
-        champ_scored = score_frame(_bundle_of(f"models:/{MODEL_NAME}@champion"), test[RAW_COLUMNS], minute)
+        champion_bundle = _bundle_of(f"models:/{MODEL_NAME}@champion")
+        champ_scored = score_frame(champion_bundle, test[RAW_COLUMNS], minute)
         champion_f1 = _metrics(y, champ_scored["is_anomaly"])["f1"]
         champion_fa = false_alarms(y, champ_scored["is_anomaly"], minute)["false_alarm_minutes"]
         print(f"champion v{champ.version} f1={champion_f1} false_alarm_minutes={champion_fa}")
     except mlflow.exceptions.MlflowException:
         print("champion 없음 (첫 모델)")
+        champion_bundle = None
+    shadow: dict = {}
+    if champion_bundle is not None:
+        try:
+            shadow = replay(new_bundle, champion_bundle)
+        except Exception as e:  # noqa: BLE001 — 비교는 참고 자료다. 실패해도 평가 결과는 낸다
+            print(f"최근 {REPLAY_HOURS}시간 재채점 실패: {type(e).__name__}: {e}")
 
     # 통과 조건: 최소 F1, 기준선보다 크게 나쁘지 않음(0.02 이내), champion 보다 나빠지지 않음(0.01 이내),
     # 같은 평가 데이터에서 champion 보다 오탐이 늘지 않음 (1분까지는 표본 흔들림으로 봄).
@@ -298,13 +351,14 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
         "champion_false_alarm_minutes": champion_fa,
         **by_kind,
         **eps,
+        **shadow,
         "passed": passed,
     }
     with mlflow.start_run(run_id=run_id):
         mlflow.log_metrics({f"test_{k}": v for k, v in model_m.items()})
         mlflow.log_metrics({f"baseline_{k}": v for k, v in base_m.items()})
         mlflow.log_metrics({f"iforest_{k}": v for k, v in iforest_m.items()})
-        mlflow.log_metrics({**fa, **by_kind, **{k: v for k, v in eps.items() if not isinstance(v, str)}})
+        mlflow.log_metrics({**fa, **by_kind, **shadow, **{k: v for k, v in eps.items() if not isinstance(v, str)}})
         if champion_fa is not None:
             mlflow.log_metric("champion_false_alarm_minutes", champion_fa)
         if champion_f1 is not None:
@@ -375,6 +429,7 @@ def summary(workflow: str) -> dict:
             "episodes_detected": m.get("episodes_detected"),
             "detect_late_minutes_median": m.get("detect_late_minutes_median"),
             "detect_late_minutes_max": m.get("detect_late_minutes_max"),
+            "replay": {k.removeprefix("replay_"): m.get(k) for k in m if k.startswith("replay_")} or None,
             "recall_by_kind": {k.removeprefix("recall_"): v for k, v in m.items() if k.startswith("recall_")},
             "data": {k: p.get(k) for k in ("data_start", "data_end", "train_rows", "test_rows", "test_anomaly_rows")},
         }

@@ -1,6 +1,6 @@
 # 이상 탐지 멈춤과 모델 승격·되돌리기
 
-관련 알림: `AnomalyBaselineDrift`, `AnomalyMonitorStale`, `AnomalyMonitorAbsent`.
+관련 알림: `DemoAnomalyUnexplained`, `AnomalyBaselineDrift`, `AnomalyMonitorStale`, `AnomalyMonitorAbsent`.
 
 ## 증상
 
@@ -22,6 +22,7 @@
 
 ## 판단
 
+- `DemoAnomalyUnexplained`: 모델은 이상이라는데 demo 의 다른 알림이 없다. `detect_anomalies` 의 main_signal 과 z 로 어느 지표가 얼마나 벗어났는지 보고, 그 지표를 직접 조회해 실제 변화인지 확인한다. 실제 변화가 없고 z 만 한쪽으로 치우쳐 있으면 기준 이동이다 (아래).
 - `AnomalyBaselineDrift`: 특성 하나의 z 가 6시간 중앙값으로 2 를 넘은 채 머문다. 장애가 아니라 평소 수준이 바뀐 것이다 (배포로 메모리 사용량이 달라짐, 트래픽 수준 변화). 그대로 두면 작은 변화에도 이상으로 판정하거나 반대로 무뎌진다. 재학습 대상이다.
 - 그 특성에 대한 알림(`DemoHighLatency`, `DemoMemoryNearLimit` 등)이 함께 울리고 있으면 기준 이동이 아니라 오래가는 장애다. 그 알림부터 본다.
 

@@ -15,6 +15,13 @@
 - 그 파드에서 무슨 일이 있었나: mcp-loki `security_events` (같은 파드의 커널 보안 이벤트).
 - 평소 demo 의 정책 차단은 0 이다. 한 건이라도 있으면 평소와 다른 것이다.
 
+에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):
+
+```checks
+prometheus__query_instant {"query": "sum by (destination_namespace, destination_workload) (increase(hubble_drop_total{source_namespace=\"demo\", reason=\"POLICY_DENIED\"}[15m]))"}
+loki__security_events {"minutes": 30}
+```
+
 ## 판단
 
 - 다른 네임스페이스의 서비스(n8n, keycloak, DB)로 가려 했으면 횡이동 시도다.

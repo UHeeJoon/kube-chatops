@@ -16,6 +16,16 @@
 - 트래픽이 함께 늘었는지. 늘었으면 용량 부족이다.
 - 주입 여부: `demo_chaos_active{kind="latency"}`.
 
+에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):
+
+```checks
+prometheus__query_range {"query": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"demo\"}[2m])))", "minutes": 30}
+prometheus__query_instant {"query": "histogram_quantile(0.95, sum by (le, pod) (rate(http_request_duration_seconds_bucket{namespace=\"demo\"}[2m])))"}
+prometheus__query_instant {"query": "sum(rate(http_requests_total{namespace=\"demo\"}[2m]))"}
+prometheus__query_instant {"query": "demo_chaos_active{namespace=\"demo\"}"}
+k8s__rollout_history {"name": "demo-app", "namespace": "demo"}
+```
+
 ## 원인 후보
 
 - CPU 부족 또는 throttling.

@@ -81,18 +81,28 @@ async def get_pod_status(namespace: str = "demo", label_selector: str | None = N
     if label_selector and not LABEL_SELECTOR.fullmatch(label_selector):
         raise ToolInputError("label_selector 는 key=value 를 쉼표로 이은 형식이어야 합니다 (예: app.kubernetes.io/name=demo-app)")
     pods = await _call(core.list_namespaced_pod, ns, label_selector=label_selector or "", limit=50)
-    items = [
-        {
-            "name": p.metadata.name,
-            "phase": p.status.phase,
-            "node": p.spec.node_name,
-            "age": _age(p.metadata.creation_timestamp),
-            "containers": [_container_state(cs) for cs in (p.status.container_statuses or [])],
-            "conditions": [{"type": c.type, "status": c.status, "reason": c.reason} for c in (p.status.conditions or []) if c.status != "True"],
-        }
-        for p in pods.items
-    ]
+    items = [_pod_row(p) for p in pods.items]
     return to_json({"namespace": namespace, "count": len(items), "pods": items})
+
+
+def _pod_row(p) -> dict:
+    """멀쩡한 파드(Running, 전부 준비됨, 재시작·종료 기록 없음)는 한 줄로 줄인다. 문제가 있는 파드만 컨테이너별로 자세히.
+
+    파드 8개에 2,300자였고 대부분 멀쩡한 파드의 이미지 주소였다. 이미지·개정은 rollout_history 가 알려 준다.
+    """
+    statuses = p.status.container_statuses or []
+    row = {"name": p.metadata.name, "phase": p.status.phase, "node": p.spec.node_name, "age": _age(p.metadata.creation_timestamp),
+           "ready": f"{sum(1 for cs in statuses if cs.ready)}/{len(statuses)}", "restarts": sum(cs.restart_count for cs in statuses)}
+    labels = p.metadata.labels or {}
+    if labels.get("security.kube-chatops/quarantine"):
+        row["quarantined"] = True
+    not_true = [{"type": c.type, "status": c.status, "reason": c.reason} for c in (p.status.conditions or []) if c.status != "True"]
+    healthy = (p.status.phase == "Running" and statuses and all(cs.ready and not cs.restart_count and not (cs.last_state and cs.last_state.terminated) for cs in statuses)
+               and not not_true)
+    if not healthy:
+        row["containers"] = [_container_state(cs) for cs in statuses]
+        row["conditions"] = not_true
+    return row
 
 
 @server.tool()

@@ -3,6 +3,9 @@
 import asyncio
 import json
 
+from pathlib import Path
+
+from app.prefetch import MAX_CHECKS, parse_checks, split_checks
 from app.prefetch import prefetch as _prefetch
 
 ALERT = {"alerts": [{"labels": {"alertname": "DemoHighLatency"}, "annotations": {"summary": "p95 응답 시간 증가"}}]}
@@ -43,3 +46,42 @@ def test_falls_back_to_section_when_document_fails():
     for tb in (FakeToolbox(document=None), FakeToolbox(document_error=True), FakeToolbox(tools=("runbook__search_runbooks",))):
         parts = run(tb)
         assert len(parts) == 1 and "p95 가 오른다" in parts[0] and "## 조치" not in parts[0]
+
+
+CHECKS_DOC = {**DOC, "content": DOC["content"].replace("## 조치", "에이전트가 조사를 시작할 때 미리 실행하는 조회 (도구 이름과 인자, 한 줄에 하나):\n\n```checks\n"
+                                                      'prometheus__query_instant {"query": "up{namespace=\\"demo\\"}"}\nk8s__get_pod_status {"namespace": "demo"}\n'
+                                                      'runbook__get_document {"document_id": 1}\nk8s__delete_pod {"name": "x"}\n깨진 줄 {{{\n```\n\n## 조치')}
+TOOLS = ("runbook__search_runbooks", "runbook__get_document", "runbook__incident_lookup", "prometheus__query_instant", "k8s__get_pod_status")
+
+
+def test_runbook_checks_are_run_and_attached():
+    tb = FakeToolbox(document=CHECKS_DOC, tools=TOOLS)
+    parts = run(tb)
+    assert len(parts) == 2 and parts[1].startswith("런북의 확인 항목을 방금 실행한 결과")
+    # 가진 조회 도구만 실행한다: 런북 도구, 없는 도구, 깨진 줄은 건너뛴다
+    assert sorted(c for c in tb.calls if not c.startswith("runbook__")) == ["k8s__get_pod_status", "prometheus__query_instant"]
+    assert tb.calls.count("runbook__get_document") == 1
+    assert "```checks" not in parts[0] and "## 조치" in parts[0] and "## 확인" in parts[0]
+
+
+def test_checks_are_capped():
+    body = json.dumps({"content": "미리 실행하는 조회:\n\n```checks\n" + "t {}\n" * 9 + "```\n"})
+    assert len(split_checks(body, {"t"})[1]) == MAX_CHECKS
+
+
+def test_every_runbook_checks_block_is_well_formed():
+    known = {"prometheus__query_instant", "prometheus__query_range", "prometheus__list_firing_alerts", "k8s__get_pod_status", "k8s__get_events",
+             "k8s__describe_deployment", "k8s__rollout_history", "loki__search_logs", "loki__error_summary", "loki__security_events", "loki__waf_blocks",
+             "anomaly__detect_anomalies"}
+    runbooks = Path(__file__).resolve().parents[2] / "mcp-runbook" / "runbooks"
+    with_checks = 0
+    for path in sorted(runbooks.glob("*.md")):
+        text = path.read_text()
+        if "```checks" not in text:
+            continue
+        with_checks += 1
+        body, checks = split_checks(json.dumps({"content": text}), known)
+        lines = [ln for ln in text.split("```checks\n")[1].split("```")[0].splitlines() if ln.strip()]
+        assert len(checks) == len(lines) <= MAX_CHECKS, path.name  # 모든 줄이 아는 도구이고 JSON 인자다
+        assert "```checks" not in body and len(parse_checks("\n".join(lines))) == len(lines)
+    assert with_checks >= 5

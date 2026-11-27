@@ -248,11 +248,12 @@ impl RunbookServer {
             return format!("입력 오류: value 는 영문·숫자와 . : - _ / 만 (120자 이하), k 는 1~{MAX_K}");
         }
         match db::lookup(&self.app.pool, kind, value, k).await {
-            Ok((total, rows)) => {
+            Ok((total, first, rows)) => {
                 SEARCHES.with_label_values(&["incident_lookup", if rows.is_empty() { "empty" } else { "hit" }]).inc();
-                json!({ "kind": kind, "value": value, "total": total, "incidents": rows,
+                let incidents: Vec<Value> = rows.iter().map(|r| compact_incident(r, kind)).collect();
+                json!({ "kind": kind, "value": value, "total": total, "first_recorded": first, "incidents": incidents,
                         "trust": "generated",
-                        "note": "값이 같은 사건입니다 (trust=generated: 자동으로 남긴 글, meta.tainted=true 면 값 대조에만 사용). 같은 값이라도 원인이 같다는 뜻은 아닙니다 (같은 IP 의 다른 시도일 수 있음). 전문은 get_document(document_id)." }).to_string()
+                        "note": "값이 같은 사건, 최근 것부터 (자동으로 남긴 글. tainted=true 면 값 대조에만 사용). 같은 값이라도 원인이 같다는 뜻은 아닙니다. 전문은 get_document(document_id)." }).to_string()
             }
             Err(e) => {
                 SEARCHES.with_label_values(&["incident_lookup", "error"]).inc();
@@ -274,6 +275,25 @@ impl RunbookServer {
             Err(e) => format!("도구 실행 실패: {e}"),
         }
     }
+}
+
+/// 사건 조회 한 줄: 재발 판단에 쓰는 것만 남긴다 (몇 번 사건인지, 언제, 무엇이었나, 함께 나온 다른 개체).
+/// 찾은 값 자체와 알림 이름·네임스페이스·심각도는 사건마다 되풀이돼 뺐다 (3건에 1,500자 → 약 600자).
+fn compact_incident(row: &db::Related, queried: &str) -> Value {
+    let mut out = json!({
+        "incident_id": row.meta.get("incident_id").cloned().unwrap_or(Value::Null),
+        "at": row.recorded_at, "title": row.title, "document_id": row.document_id,
+    });
+    if row.meta.get("tainted").and_then(Value::as_bool).unwrap_or(false) {
+        out["tainted"] = json!(true);
+    }
+    if let Some(entities) = row.meta.get("entities").and_then(Value::as_object) {
+        let others: serde_json::Map<String, Value> = entities.iter().filter(|(k, _)| k.as_str() != queried).map(|(k, v)| (k.clone(), v.clone())).collect();
+        if !others.is_empty() {
+            out["with"] = Value::Object(others);
+        }
+    }
+    out
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -445,6 +465,25 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{compact_incident, db};
+    use serde_json::json;
+
+    #[test]
+    fn compact_incident_keeps_recurrence_facts() {
+        let row = db::Related {
+            document_id: 40, title: "사건 #8: SQLi 차단".into(), source: "incident/8/report/5".into(), recorded_at: "2026-11-27 23:40".into(),
+            meta: json!({"incident_id": 8, "alertname": "DemoWafAttackBlocked", "namespace": "demo", "tainted": true,
+                         "entities": {"alert": ["DemoWafAttackBlocked"], "ip": ["198.51.100.89"]}}),
+        };
+        let v = compact_incident(&row, "alert");
+        assert_eq!(v["incident_id"], 8);
+        assert_eq!(v["tainted"], true);
+        assert_eq!(v["with"], json!({"ip": ["198.51.100.89"]}));
+        assert!(v.get("alertname").is_none() && v.get("source").is_none());
+        let clean = db::Related { meta: json!({"incident_id": 9}), ..row };
+        assert!(compact_incident(&clean, "alert").get("tainted").is_none());
+    }
+
     #[test]
     fn incident_source_only() {
         assert!(super::incident_source("incident/7/report/1"));

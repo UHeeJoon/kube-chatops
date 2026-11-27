@@ -78,6 +78,33 @@ def _lines(result: list[dict], limit: int) -> list[dict]:
     return rows[:limit]
 
 
+_DIGITS = re.compile(r"\d+")
+MAX_GROUPS = 20
+
+
+def group_lines(rows: list[dict], max_groups: int = MAX_GROUPS) -> list[dict]:
+    """숫자만 다른 줄(시각, 주문 번호, 걸린 시간)을 한 묶음으로. 묶음마다 가장 최근 줄 하나와 횟수·기간·파드를 남긴다.
+
+    로그 50줄은 대개 같은 오류의 반복이다 (11-28 측정: 한 번에 최대 8,800자). 모델에게 필요한 것은
+    "어떤 줄이 몇 번, 언제부터 언제까지, 어느 파드에서" 다. rows 는 최근 것부터 정렬돼 있다.
+    """
+    groups: dict[str, dict] = {}
+    for r in rows:
+        g = groups.get(key := _DIGITS.sub("#", r["line"]))
+        if g is None:
+            groups[key] = {"line": r["line"], "count": 1, "last_ts": r["ts"], "first_ts": r["ts"], "pods": [r["pod"]]}
+            continue
+        g["count"] += 1
+        g["first_ts"] = r["ts"]
+        if r["pod"] not in g["pods"]:
+            g["pods"].append(r["pod"])
+    out = list(groups.values())[:max_groups]
+    for g in out:
+        if g["count"] == 1:
+            del g["first_ts"]
+    return out
+
+
 def _service_of(pod: str) -> str:
     """demo-app-5cffff9675-abcde → demo-app (Deployment 파드 이름에서 해시 두 덩어리를 뗀다)."""
     m = re.fullmatch(r"(.+?)-[a-z0-9]{6,10}-[a-z0-9]{5}", pod) or re.fullmatch(r"(.+?)-[a-z0-9]{5}", pod)
@@ -112,7 +139,8 @@ async def search_logs(
     start, end = _window(minutes)
     data = await _get("query_range", {"query": query, "start": start, "end": end, "limit": limit, "direction": "backward"})
     rows = _lines(data["result"], limit)
-    return to_json({"query": query, "returned": len(rows), "lines": rows})
+    groups = group_lines(rows)
+    return to_json({"scanned_lines": len(rows), "distinct": len(groups), "lines": groups})
 
 
 @server.tool()

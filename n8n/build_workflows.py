@@ -502,11 +502,22 @@ if (r.f1 !== undefined) {
       ((r.champion_false_alarm_minutes === null || r.champion_false_alarm_minutes === undefined) ? '' : ` · 지금 서빙은 같은 데이터에서 ${r.champion_false_alarm_minutes}분`);
   const cv = (r.cv_false_alarm_minutes === null || r.cv_false_alarm_minutes === undefined) ? ''
     : `• 오탐(교차 검증, 정상 ${r.cv_normal_days}일 전체): *${r.cv_false_alarm_minutes}분* (${r.cv_false_alarm_events}건)\n`;
+  // 장애를 건으로 센 것: 분 단위 재현율은 긴 장애 하나가 좌우한다
+  const has = v => v !== null && v !== undefined;
+  const eps = !has(r.episodes) ? ''
+    : `• 장애 ${r.episodes}건 중 *${r.episodes_detected}건* 탐지` + (has(r.detect_late_minutes_max) ? ` · 탐지 지연 중앙값 ${r.detect_late_minutes_median}분, 최대 ${r.detect_late_minutes_max}분 (주입 3분 뒤부터)` : '') + `\n`;
+  // 최근 24시간을 새 모델과 지금 서빙 모델로 다시 채점해 판정이 갈린 분
+  const rp = r.replay;
+  const rep = !rp || !has(rp.minutes) ? ''
+    : `• 최근 24시간 재채점 (${rp.minutes}분): 새 모델 이상 ${rp.new_anomaly_minutes}분, 지금 서빙 ${rp.champion_anomaly_minutes}분` +
+      ` · 새 모델만 이상: 장애 중 ${rp.only_new_in_trouble}분, 평온할 때 *${rp.only_new_in_quiet}분*` +
+      ` · 지금 서빙만 이상: 장애 중 ${rp.only_champion_in_trouble}분, 평온할 때 ${rp.only_champion_in_quiet}분\n`;
   blocks.push(sec(
     `*평가* (정상 뒤쪽 + 장애 구간 ${r.data?.test_anomaly_rows ?? '?'}분)\n` +
     `• F1 *${pct(r.f1)}* · precision ${pct(r.precision)} · recall ${pct(r.recall)}\n` +
     `• 장애 종류별 재현율: ${kinds}\n` +
-    `• 오탐 ${fa}\n` + cv +
+    eps +
+    `• 오탐 ${fa}\n` + cv + rep +
     `• 비교: z-score 기준선 F1 ${pct(r.baseline_f1)}, IsolationForest 단독 F1 ${pct(r.iforest_f1)}\n` +
     `• 지금 서빙(champion): ${champ ? `v${champ.version} · F1 ${pct(champ.f1)}` : '없음'}`));
 }
