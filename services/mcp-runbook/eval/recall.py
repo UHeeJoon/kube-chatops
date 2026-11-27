@@ -76,10 +76,14 @@ def main() -> None:
     ap.add_argument("--url", default="http://localhost:8080/mcp")
     ap.add_argument("--token", required=True)
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--set", choices=["dev", "heldout"], default="dev", help="dev: 런북과 함께 만든 질문, heldout: 런북을 보지 않고 쓴 질문 (eval/heldout.py)")
     a = ap.parse_args()
+    cases = CASES
+    if a.set == "heldout":
+        from heldout import CASES as cases  # noqa: PLC0415
     by_kind: dict[str, list[tuple[bool, bool]]] = {}
     misses = []
-    for kind, query, want in CASES:
+    for kind, query, want in cases:
         res = call(a.url, a.token, "search_runbooks", {"query": query, "k": 3})
         files = [r["source"].split("/")[-1] for r in res["results"]]
         at1, at3 = bool(files) and files[0] == want, want in files
@@ -92,7 +96,7 @@ def main() -> None:
         print(f"| {kind} | {len(v)} | {sum(x[0] for x in v) / len(v):.2f} | {sum(x[1] for x in v) / len(v):.2f} |")
     for m in misses:
         print(("놓침" if m[2] not in m[3] else "확인"), m)
-    if sum(x[1] for x in total) / len(total) < 0.9:
+    if a.set == "dev" and sum(x[1] for x in total) / len(total) < 0.9:
         sys.exit(1)
 
 
