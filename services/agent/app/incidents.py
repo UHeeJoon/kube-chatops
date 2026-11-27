@@ -23,7 +23,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from .safety import NOTE
+from .safety import NOTE, for_memory
 from .toolbox import Toolbox
 
 log = logging.getLogger("agent.incidents")
@@ -200,10 +200,33 @@ class Incidents:
 
 
 def search_document(incident_id: int, report_no: int, alertname: str | None, namespace: str, report: dict[str, Any] | None, question: str,
-                    timeline: dict[str, Any], pod: str | None = None) -> dict[str, Any]:
-    """런북 검색 서버에 넣을 사건 보고 한 건 (마크다운). 나중에 similar_incidents 가 이 글을 찾는다."""
-    rep = report or {}
-    headline = rep.get("headline") or question[:200]
+                    timeline: dict[str, Any], pod: str | None = None, suspicious: int = 0) -> dict[str, Any]:
+    """런북 검색 서버에 넣을 사건 보고 한 건 (마크다운). 나중에 similar_incidents 가 이 글을 찾는다.
+
+    여기 들어가는 글은 모델이 쓴 것이고, 모델은 공격자가 만든 글(요청 경로, User-Agent)을 읽고 썼다. 다음 조사가 이 글을 다시 읽으므로
+    글마다 for_memory 로 지시처럼 보이는 문장을 빼고 길이를 자른다. 그런 문장이 있었거나 조사 중 지시문 의심(suspicious)이 있었으면
+    meta.tainted 로 표시한다 (검색 결과에 그대로 나간다).
+    """
+    tainted = suspicious > 0
+
+    def safe(value: Any, limit: int = 400) -> str:
+        nonlocal tainted
+        text, hit = for_memory(value, limit)
+        tainted = tainted or hit
+        return text
+
+    def walk(value: Any, limit: int) -> Any:
+        if isinstance(value, str):
+            return safe(value, limit)
+        if isinstance(value, list):
+            return [walk(v, limit) for v in value[:20]]
+        if isinstance(value, dict):
+            return {k: walk(v, limit) for k, v in value.items()}
+        return value
+
+    rep = walk({k: (report or {}).get(k) for k in ("status", "headline", "impact", "timeline", "causes", "actions")}, 400)
+    rep = {k: v for k, v in rep.items() if v}
+    headline = rep.get("headline") or safe(question, 200)
     lines = [f"# 사건 #{incident_id}: {headline}", "", f"알림 {alertname or '없음 (Slack 질문)'} · 대상 {namespace} · {_kst(datetime.now(timezone.utc).isoformat())} (KST)"]
     if rep.get("impact"):
         lines += ["", "## 영향", ""] + [f"- {x}" for x in rep["impact"]]
@@ -229,7 +252,7 @@ def search_document(incident_id: int, report_no: int, alertname: str | None, nam
     return {"kind": "incident", "source": f"incident/{incident_id}/report/{report_no}", "title": f"사건 #{incident_id}: {headline}",
             "content": "\n".join(lines),
             "meta": {"incident_id": incident_id, "report_no": report_no, "alertname": alertname, "namespace": namespace, "severity": rep.get("status"),
-                     "entities": {k: v for k, v in entities.items() if v}}}
+                     "tainted": tainted, "entities": {k: v for k, v in entities.items() if v}}}
 
 
 def _plain(row: dict[str, Any]) -> dict[str, Any]:

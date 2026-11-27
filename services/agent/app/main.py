@@ -145,7 +145,7 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
                             trace=tool_trace(out.get("messages") or [], out.get("tool_calls", 0) + 1),
                             timeline=(timeline := await snapshot(toolbox, body.alert)), stopped_by=stopped,
                             tool_calls=out.get("tool_calls", 0), cost_usd=usage.cost_usd)
-                        await _index_incident(incident, body, out.get("report"), timeline)
+                        await _index_incident(incident, body, out.get("report"), timeline, suspicious=len(toolbox.suspicious))
                     except Exception:  # noqa: BLE001
                         log.exception("사건 기록 실패 thread=%s", body.thread_id)
     STOPS.labels(stopped).inc()
@@ -155,14 +155,14 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
             "incident": incident, "injection_suspected": suspicious}
 
 
-async def _index_incident(incident: dict[str, Any], body: InvestigateIn, report: dict[str, Any] | None, timeline: dict[str, Any]) -> None:
+async def _index_incident(incident: dict[str, Any], body: InvestigateIn, report: dict[str, Any] | None, timeline: dict[str, Any], suspicious: int = 0) -> None:
     """사건 보고를 런북 검색 서버에 넣는다 (다음 조사의 similar_incidents 가 찾을 수 있게). 실패해도 조사 결과에는 영향이 없다."""
     token = settings.mcp_token_runbook
     if not settings.runbook_ingest_url or token is None:
         return
     labels = ((body.alert or {}).get("alerts") or [{}])[0].get("labels") or {}
     doc = search_document(incident["incident_id"], incident["report_no"], labels.get("alertname"), labels.get("namespace") or "-", report, body.question, timeline,
-                          pod=labels.get("pod"))
+                          pod=labels.get("pod"), suspicious=suspicious)
     try:
         async with httpx2.AsyncClient(timeout=20) as client:
             r = await client.post(settings.runbook_ingest_url, json=doc, headers={"Authorization": f"Bearer {token.get_secret_value()}"})

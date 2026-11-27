@@ -345,7 +345,7 @@ const foot = { type: 'context', elements: [{ type: 'mrkdwn',
 const sec = t => ({ type: 'section', text: { type: 'mrkdwn', text: clip(t, 2900) } });
 // 조사 중 읽은 데이터(로그, 요청)에 지시처럼 보이는 문장이 있었으면 사람에게 알린다. 보고서가 그 문장에 휘둘렸을 수 있다.
 const sus = res.body?.injection_suspected ?? [];
-if (sus.length) foot.elements.push({ type: 'mrkdwn', text: `:warning: 조사한 데이터에 *지시처럼 보이는 문장* 이 있었음 (${sus.map(x => '`' + x + '`').join(', ')}). 에이전트는 따르지 않도록 되어 있지만, 결론과 조치 제안을 원본 로그로 한 번 확인하세요.` });
+if (sus.length) foot.elements.push({ type: 'mrkdwn', text: `:warning: 조사한 데이터에 *지시처럼 보이는 문장* 이 있었음 (${sus.map(x => '`' + x + '`').join(', ')}). 에이전트는 따르지 않도록 되어 있지만, 결론과 조치 제안을 원본 로그로 한 번 확인하세요. 이 보고서에는 승인 버튼을 붙이지 않았습니다.` });
 let blocks = [], text, result;
 if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질문 답, 또는 보고서 없이 글로 끝난 조사
   result = 'answer';
@@ -380,7 +380,9 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
     scale: ['증설 승인 (+1)', 'replicas 를 1 늘리는 커밋을 배포 저장소에 올립니다 (최대 4). 반영까지 3~5분 걸립니다.'],
   };
   const btns = [];
-  for (const a of acts) {
+  // 조사한 데이터에 지시처럼 보이는 문장이 있었으면 승인 버튼을 붙이지 않는다. 조치 제안 자체가 그 문장의 결과일 수 있으므로
+  // 버튼 하나로 실행되게 두지 않고, 사람이 원본을 확인한 뒤 직접 하게 한다 (제안 내용은 보고서에 그대로 보인다).
+  for (const a of (sus.length ? [] : acts)) {
     const m = /(?:^|\/)(demo-app)$/.exec(String(a.target ?? '').trim());
     if (a.type === 'retrain' && !btns.some(b => b.action_id === 'mlops_retrain')) {
       btns.push({ type: 'button', action_id: 'mlops_retrain', value: 'anomaly-train', text: { type: 'plain_text', text: '재학습 시작' } });
