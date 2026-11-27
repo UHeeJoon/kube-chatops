@@ -1,11 +1,11 @@
 # 이상 탐지 모델의 판정 알림 (모델만 이상, 파드 하나만 이상, 기준 이동)
 
-관련 알림: `DemoAnomalyUnexplained`, `DemoSinglePodAnomaly`, `AnomalyBaselineDrift`. 탐지기나 예측 서버가 멈춘 경우는 `anomaly-monitor.md` 를 본다.
+관련 알림: `DemoAnomalyUnexplained`, `DemoSinglePodAnomaly`, `AnomalyBaselineDrift`.
 
 ## 증상
 
 - `DemoAnomalyUnexplained`: 모델은 5분 넘게 이상이라고 하는데 지연·오류율·메모리 알림은 울리지 않는다. 임계값 규칙이 모르는 종류의 변화다.
-- `DemoSinglePodAnomaly`: 서비스 합계는 멀쩡해 보이는데 파드 하나의 값만 평소에서 벗어나 있다.
+- `DemoSinglePodAnomaly`: 서비스 합계는 멀쩡해 보이는데 파드 하나의 값만 평소에서 벗어나 있다. 복제본(파드) 여러 개 가운데 한쪽에서만 오류 응답이 나오거나 한쪽만 느리다.
 - `AnomalyBaselineDrift`: 장애는 없는데 어떤 지표가 여섯 시간 넘게 평소보다 높거나 낮은 채로 머문다.
 - 들어오는 요청이 평소 이 시간대의 절반 아래로 줄었다 (오류는 없다).
 
