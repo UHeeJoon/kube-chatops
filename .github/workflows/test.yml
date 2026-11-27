@@ -63,3 +63,14 @@ jobs:
           PYTHONPATH: ../mcp-common:.
         run: python -m pytest -q tests
 
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - name: 에이전트 단위 테스트 (인용 검증. 의존성 없는 모듈만)
+        working-directory: services/agent
+        run: python -m pytest -q tests

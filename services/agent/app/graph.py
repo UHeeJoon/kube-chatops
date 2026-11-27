@@ -37,12 +37,15 @@ import anthropic
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from opentelemetry import trace
+from prometheus_client import Counter
 
 from .budget import Ledger, Usage
 from .config import settings
-from .safety import clean, guard_tool_text
+from .safety import clean, guard_tool_text, verify_references
 from .prompts import FINISH_NOTE, INVESTIGATE_SYSTEM, REPORT_TOOL, ROUTE_SCHEMA, ROUTE_SYSTEM
 from .toolbox import Toolbox
+
+UNVERIFIED_REFS = Counter("agent_unverified_references_total", "보고서의 참고 항목 가운데 조회 기록에 없던 것")
 
 tracer = trace.get_tracer("agent.graph")
 client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value(), max_retries=2, timeout=120.0)
@@ -225,6 +228,11 @@ async def finish(state: State, runtime: Runtime[Ctx]) -> dict:
     text = "".join(b.get("text", "") for b in last["content"] if b.get("type") == "text").strip() if isinstance(last["content"], list) else ""
     # Slack 으로 나가는 글: 전체 호출, 멘션, 글자와 주소가 다른 링크를 풀어 쓴다
     report, text = clean(report), clean(text)
+    if isinstance(report, dict):
+        # 참고 항목이 이번 대화에서 실제로 받은 런북·사건인지 대조한다. 아니면 지우지 않고 표시한다
+        report["references"], unverified = verify_references(report.get("references"), state["messages"])
+        if unverified:
+            UNVERIFIED_REFS.inc(unverified)
     out: dict[str, Any] = {"report": report, "answer": None if report else (text or "답을 만들지 못했습니다."),
                            "stopped_by": state.get("stopped_by")}
     if uses:

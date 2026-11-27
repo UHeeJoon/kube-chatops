@@ -58,3 +58,81 @@ def clean(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: clean(v) for k, v in value.items()}
     return value
+
+
+# ── 인용 검증 ────────────────────────────────────────────────────────
+# 보고서의 references 는 모델이 쓴 글이다. 조회한 적 없는 런북이나 사건 번호를 지어내도 그대로 Slack 에 나갔다.
+# 이번 대화에서 실제로 모델 앞에 놓였던 글(선조회, 도구 결과)에 그 런북 제목·파일·사건 번호가 있었는지 대조하고,
+# 없으면 지우지 않고 표시한다 (사람이 판단하게).
+
+UNVERIFIED = " (조회 기록 없음)"
+_TITLE = re.compile(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_SOURCE = re.compile(r'"source"\s*:\s*"([^"\\]+)"')
+_INCIDENT_SEEN = re.compile(r"incident/(\d+)(?:/|\b)|사건 #(\d+)")
+_INCIDENT_REF = re.compile(r"(?:사건|incident)\s*#?\s*(\d+)", re.IGNORECASE)
+_RUNBOOK_FILE = re.compile(r"([a-z0-9][a-z0-9-]*\.md)")
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[\s\"'`()\[\]:·,.\-]+", "", s).lower()
+
+
+def seen_sources(messages: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """대화에서 모델이 받은 글(user 쪽: 선조회와 도구 결과)에 나온 런북 제목·파일, 사건 번호."""
+    texts: list[str] = []
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+            continue
+        for block in content or []:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content") if block.get("type") == "tool_result" else block.get("text")
+            if isinstance(inner, str):
+                texts.append(inner)
+            elif isinstance(inner, list):
+                texts += [b.get("text", "") for b in inner if isinstance(b, dict)]
+    blob = "\n".join(texts)
+    titles, files, incidents = set(), set(), set()
+    for raw in _TITLE.findall(blob):
+        title = raw.replace('\\"', '"')
+        if title.startswith("사건 #"):
+            continue  # 사건 문서의 제목은 번호로 본다
+        if len(_norm(title)) >= 4:
+            titles.add(_norm(title))
+    for src in _SOURCE.findall(blob):
+        if src.endswith(".md"):
+            files.add(src.rsplit("/", 1)[-1])
+    for a, b in _INCIDENT_SEEN.findall(blob):
+        incidents.add(a or b)
+    return {"titles": titles, "files": files, "incidents": incidents}
+
+
+def verify_references(references: Any, messages: list[dict[str, Any]]) -> tuple[Any, int]:
+    """references 를 대조해 근거 없는 항목 끝에 UNVERIFIED 를 붙인다. 돌려주는 값: (references, 표시한 수).
+
+    사건 번호가 있으면 번호로, 아니면 런북 제목이나 파일 이름으로 본다. 어느 쪽인지 알 수 없는 글은 런북으로 본다
+    (references 에는 런북과 과거 사건만 적게 되어 있다).
+    """
+    if not isinstance(references, list) or not references:
+        return references, 0
+    seen = seen_sources(messages)
+    out, flagged = [], 0
+    for ref in references:
+        if not isinstance(ref, str) or not ref.strip():
+            continue
+        numbers = _INCIDENT_REF.findall(ref)
+        if numbers:
+            ok = all(n in seen["incidents"] for n in numbers)
+        else:
+            norm = _norm(ref)
+            ok = any(t in norm for t in seen["titles"]) or any(f in seen["files"] for f in _RUNBOOK_FILE.findall(ref))
+        if ok:
+            out.append(ref)
+        else:
+            out.append(ref.rstrip() + UNVERIFIED)
+            flagged += 1
+    return out, flagged
