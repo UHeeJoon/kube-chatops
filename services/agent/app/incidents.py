@@ -3,7 +3,8 @@
 왜: 보고서는 Slack 스레드에만 있었고, 근거가 된 원본 로그(Loki)는 7일 뒤 지워진다. "누가 언제 어떤 요청을
 연달아 보냈나" 를 나중에 다시 볼 곳이 없었다 (11-27).
 
-- 사건(incidents): 같은 네임스페이스에서 INCIDENT_GAP_MINUTES 안에 이어진 알림 조사를 하나로 묶는다
+- 사건(incidents): 같은 네임스페이스에서 INCIDENT_GAP_MINUTES 안에 이어진 알림 조사를 하나로 묶는다. 보안 알림은 서로 묶고,
+  장애 알림은 같은 알림이거나 같은 파드일 때만 묶는다 (이어서 난 다른 장애가 한 사건이 되지 않게)
   (예: WAF 차단 → 웹셸 차단 → 투하 실행 차단 = 한 번의 공격). 사람이 Slack 에서 물어 시작한 조사는 묶지 않고 하나씩.
 - 보고(incident_reports): 조사 한 번. 알림 원문, 에이전트 보고서, 에이전트가 부른 도구와 결과,
   그리고 그 시점의 타임라인 스냅숏(막힌 요청의 출발 IP·규칙·시각, 커널 보안 이벤트)을 함께 넣는다.
@@ -65,6 +66,9 @@ SCHEMA = (
     )
     """,
     "create index if not exists incident_reports_incident on incident_reports (incident_id, at)",
+    # 묶는 기준 (11-27 추가): 보안 알림끼리, 또는 같은 알림·같은 파드의 장애 알림끼리
+    "alter table incidents add column if not exists category text not null default 'ops'",
+    "alter table incidents add column if not exists pods text[] not null default '{}'",
     "create index if not exists incidents_last_at on incidents (last_at desc)",
 )
 SEVERITY_RANK = {"critical": 3, "warning": 2, "ok": 1}
@@ -137,27 +141,36 @@ class Incidents:
         alertname = labels.get("alertname")
         namespace = labels.get("namespace") or "-"
         source = "alert" if alert else "question"
+        category = "security" if labels.get("category") == "security" else "ops"
+        pods = sorted({str(a.get("labels", {}).get("pod")) for a in (alert or {}).get("alerts") or [] if a.get("labels", {}).get("pod")})
         severity = (report or {}).get("status") or labels.get("severity")
         title = (report or {}).get("headline") or question[:200]
         async with self.pool.connection() as conn, conn.transaction():
             row = None
-            if alert:  # 알림에서 온 조사만 묶는다
+            if alert:
+                # 알림에서 온 조사만 묶는다. 30분 안에 이어졌다고 다 같은 일은 아니다 (지연 장애 뒤의 오류 장애는 다른 사건).
+                #   보안: 같은 네임스페이스의 보안 알림은 한 공격의 단계로 본다 (WAF 차단 → 실행 차단 → 격리)
+                #   장애: 같은 알림이 다시 울렸거나 같은 파드의 알림일 때만 (메모리 한도 근접 → 그 파드의 재시작)
                 cur = await conn.execute(
-                    "select id, severity from incidents where source = 'alert' and namespace = %s and last_at > now() - make_interval(mins => %s) "
-                    "order by last_at desc limit 1 for update", (namespace, INCIDENT_GAP_MINUTES))
+                    "select id, severity from incidents where source = 'alert' and namespace = %s and category = %s "
+                    "and last_at > now() - make_interval(mins => %s) "
+                    "and (%s = 'security' or %s = any(alert_names) or pods && %s::text[]) "
+                    "order by last_at desc limit 1 for update",
+                    (namespace, category, INCIDENT_GAP_MINUTES, category, alertname or "", pods))
                 row = await cur.fetchone()
             if row is None:
                 cur = await conn.execute(
-                    "insert into incidents (namespace, source, severity, title, alert_names) values (%s, %s, %s, %s, %s) returning id",
-                    (namespace, source, severity, title, [alertname] if alertname else []))
+                    "insert into incidents (namespace, source, severity, title, alert_names, category, pods) values (%s, %s, %s, %s, %s, %s, %s) returning id",
+                    (namespace, source, severity, title, [alertname] if alertname else [], category, pods))
                 incident_id = (await cur.fetchone())["id"]
             else:
                 incident_id = row["id"]
                 worse = SEVERITY_RANK.get(severity or "", 0) > SEVERITY_RANK.get(row["severity"] or "", 0)
                 await conn.execute(
                     "update incidents set last_at = now(), severity = %s, "
-                    "alert_names = (select array(select distinct unnest(alert_names || %s::text[]))) where id = %s",
-                    (severity if worse else row["severity"], [alertname] if alertname else [], incident_id))
+                    "alert_names = (select array(select distinct unnest(alert_names || %s::text[]))), "
+                    "pods = (select array(select distinct unnest(pods || %s::text[]))) where id = %s",
+                    (severity if worse else row["severity"], [alertname] if alertname else [], pods, incident_id))
             await conn.execute(
                 "insert into incident_reports (incident_id, thread_id, alertname, question, alert, report, tool_trace, timeline, stopped_by, tool_calls, cost_usd) "
                 "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
