@@ -22,6 +22,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from .safety import NOTE
 from .toolbox import Toolbox
 
 log = logging.getLogger("agent.incidents")
@@ -76,7 +77,7 @@ TIMELINE_TOOLS = (
 
 def _unwrap(text: str) -> Any:
     """<tool_output> 포장을 벗기고, JSON 이면 객체로."""
-    body = re.sub(r"^<tool_output>\n|\n</tool_output>$", "", text)
+    body = re.sub(r"^<tool_output>\n|\n</tool_output>$", "", text).removeprefix(NOTE)  # 지시문 주의 문구가 붙어 있으면 뗀다
     try:
         return json.loads(body)
     except ValueError:
@@ -193,6 +194,8 @@ def search_document(incident_id: int, report_no: int, alertname: str | None, nam
     lines = [f"# 사건 #{incident_id}: {headline}", "", f"알림 {alertname or '없음 (Slack 질문)'} · 대상 {namespace} · {_kst(datetime.now(timezone.utc).isoformat())} (KST)"]
     if rep.get("impact"):
         lines += ["", "## 영향", ""] + [f"- {x}" for x in rep["impact"]]
+    if rep.get("timeline"):
+        lines += ["", "## 경과", ""] + [f"- {t.get('time')} {t.get('event')}" for t in rep["timeline"]]
     if rep.get("causes"):
         lines += ["", "## 원인", ""]
         for c in rep["causes"]:
@@ -279,6 +282,8 @@ def to_markdown(inc: dict[str, Any]) -> str:
         lines += ["", f"## 보고 #{r['id']} · {_kst(r['at'])} · {r.get('alertname') or 'Slack 질문'}", "", rep.get("headline") or r.get("question") or ""]
         if rep.get("impact"):
             lines += ["", "**영향**"] + [f"- {x}" for x in rep["impact"]]
+        if rep.get("timeline"):
+            lines += ["", "**경과 (에이전트가 확인한 것)**"] + [f"- {t.get('time')} {t.get('event')}" for t in rep["timeline"]]
         for i, c in enumerate(rep.get("causes") or [], 1):
             lines += ["", f"**원인 {i}** ({round((c.get('confidence') or 0) * 100)}%) {c.get('title')}"] + [f"- {e}" for e in c.get("evidence") or []]
         acts = [a for a in rep.get("actions") or [] if a.get("type") != "none"]
@@ -286,6 +291,8 @@ def to_markdown(inc: dict[str, Any]) -> str:
             lines += ["", "**조치 제안**"] + [f"- `{a['type']}` {a['target']}: {a['reason']} (위험 {a['risk']})" for a in acts]
         if rep.get("data_gaps"):
             lines += ["", "**확인 못 한 것**"] + [f"- {x}" for x in rep["data_gaps"]]
+        if rep.get("references"):
+            lines += ["", "**참고**"] + [f"- {x}" for x in rep["references"]]
         trace = r.get("tool_trace") or []
         if trace:
             lines += ["", "**조사에 쓴 도구**"] + [f"- `{t['tool']}` {json.dumps(t.get('args'), ensure_ascii=False)}" for t in trace]

@@ -44,6 +44,18 @@ CASES = [
     ("바꿔 말함", "모델을 새 버전으로 바꾼 뒤 예측 서버가 500 을 낸다", "anomaly-monitor.md"),
     ("알림", "KeycloakLoginFailuresHigh 로그인 실패 5분 28건", "keycloak-login-failures.md"),
     ("바꿔 말함", "누가 관리자 계정 비밀번호를 계속 틀리게 넣고 있다", "keycloak-login-failures.md"),
+    ("바꿔 말함", "오류는 없는데 들어오는 요청이 갑자기 0 이 됐다", "traffic-drop.md"),
+    ("사람", "load-gen 이 죽었는지 rps 가 뚝 떨어졌어", "traffic-drop.md"),
+    ("알림", "FailedScheduling Insufficient memory", "pod-pending-resources.md"),
+    ("바꿔 말함", "replicas 를 늘렸는데 새로 만든 것만 안 뜬다", "pod-pending-resources.md"),
+    ("사람", "로그에 connection refused 랑 timeout 이 계속 찍혀", "dependency-failure.md"),
+    ("바꿔 말함", "앱은 멀쩡한데 다른 서비스 이름을 못 찾는다", "dependency-failure.md"),
+    ("사람", "봇이 예산 다 썼다고 조사를 안 해", "agent-degraded.md"),
+    ("바꿔 말함", "AI 가 도구 서버에 붙지 못해 근거 없이 답한다", "agent-degraded.md"),
+    ("알림", "verify-kube-chatops-images PolicyReport fail", "image-policy-violation.md"),
+    ("바꿔 말함", "CI 를 거치지 않은 컨테이너가 배포됐다", "image-policy-violation.md"),
+    ("사람", "보고서에 지시처럼 보이는 문장이 있었다는 경고가 붙었어", "suspicious-instructions-in-data.md"),
+    ("바꿔 말함", "User-Agent 에 AI 한테 거짓 보고를 시키는 글이 들어 있다", "suspicious-instructions-in-data.md"),
 ]
 
 

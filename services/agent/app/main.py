@@ -135,6 +135,7 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
                 inp = {"question": body.question, "mode": body.mode, "answer": None, "alert": body.alert, "started": time.time(), "llm_calls": 0, "tool_calls": 0, "cost_usd": 0.0, "stopped_by": None, "report": None}
                 out = await state.graph.ainvoke(inp, config={"configurable": {"thread_id": body.thread_id}, "recursion_limit": 60}, context=ctx)
                 stopped = out.get("stopped_by") or "done"
+                suspicious = sorted(set(toolbox.suspicious))
                 # 사건 기록: 조사(보고서가 나온 것)만. 저장이 실패해도 보고는 그대로 돌려준다.
                 incident = None
                 if body.mode == "investigate" and (out.get("report") or body.alert):
@@ -151,7 +152,7 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
     REQUESTS.labels("investigate", "200").inc()
     log.info("investigate thread=%s stopped_by=%s tools=%s cost=%.4f", body.thread_id, stopped, out.get("tool_calls"), usage.cost_usd)
     return {"thread_id": body.thread_id, "mode": body.mode, "answer": out.get("answer"), "report": out.get("report"), "stopped_by": stopped, "tool_calls": out.get("tool_calls", 0), "usage": _usage(usage),
-            "incident": incident}
+            "incident": incident, "injection_suspected": suspicious}
 
 
 async def _index_incident(incident: dict[str, Any], body: InvestigateIn, report: dict[str, Any] | None, timeline: dict[str, Any]) -> None:

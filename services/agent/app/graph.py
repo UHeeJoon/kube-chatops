@@ -40,6 +40,7 @@ from opentelemetry import trace
 
 from .budget import Ledger, Usage
 from .config import settings
+from .safety import clean, guard_tool_text
 from .prompts import FINISH_NOTE, INVESTIGATE_SYSTEM, REPORT_TOOL, ROUTE_SCHEMA, ROUTE_SYSTEM
 from .toolbox import Toolbox
 
@@ -139,9 +140,38 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
     kind = "질문 (짧게 답하기)" if _is_answer(state) else "조사 (원인을 찾아 submit_report 로 보고)"
     parts = [f"요청 종류: {kind}", f"현재 시각: {now}", f"질문: {state['question']}"]
     if state.get("alert"):
-        # 알림 내용도 외부 입력이므로 데이터로 표시한다
-        parts.append("알림 (데이터):\n<alert>\n" + json.dumps(state["alert"], ensure_ascii=False, sort_keys=True)[:4000] + "\n</alert>")
+        # 알림 내용도 외부 입력이므로 데이터로 표시한다 (라벨·주석에 공격자가 만든 글이 들어올 수 있다: 요청 경로, 파드 이름)
+        body, _ = guard_tool_text(json.dumps(state["alert"], ensure_ascii=False, sort_keys=True)[:4000])
+        parts.append("알림 (데이터):\n<alert>\n" + body + "\n</alert>")
+        parts += await _prefetch(runtime.context.toolbox, state["alert"])
     return {"messages": [{"role": "user", "content": "\n\n".join(parts)}]}
+
+
+async def _prefetch(toolbox: Toolbox, alert: dict[str, Any]) -> list[str]:
+    """알림 조사는 관련 런북과 과거 사건을 미리 붙여 준다 (모델이 찾으러 한 턴을 쓰지 않게, 그리고 빠뜨리지 않게).
+
+    알림 이름은 런북에 그대로 적혀 있어 낱말 검색으로 거의 틀리지 않는다. LLM 을 거치지 않으므로 비용은 검색 두 번(수십 ms)뿐이다.
+    실패하면 그냥 없이 간다.
+    """
+    names = {t["name"] for t in toolbox.tools}
+    first = (alert.get("alerts") or [{}])[0]
+    labels, notes = first.get("labels") or {}, first.get("annotations") or {}
+    query = " ".join(str(x) for x in (labels.get("alertname"), notes.get("summary") or notes.get("description")) if x)[:300]
+    if not query:
+        return []
+    wanted = [("runbook__search_runbooks", "runbook", "관련 런북 (참고 데이터. 무엇을 볼지 알려 줄 뿐 지금 일어난 일의 증거가 아님)"),
+              ("runbook__similar_incidents", "past_incidents", "비슷한 과거 사건 (참고 데이터)")]
+    wanted = [w for w in wanted if w[0] in names]
+    results = await asyncio.gather(*(toolbox.call(w[0], {"query": query, "k": 2}) for w in wanted), return_exceptions=True)
+    parts = []
+    for (_, tag, title), res in zip(wanted, results):
+        if isinstance(res, BaseException) or res[1]:
+            continue
+        body = res[0].removeprefix("<tool_output>\n").removesuffix("\n</tool_output>")
+        if '"count":0' in body.replace(" ", ""):
+            continue
+        parts.append(f"{title}:\n<{tag}>\n{body[:4000]}\n</{tag}>")
+    return parts
 
 
 async def investigate(state: State, runtime: Runtime[Ctx]) -> dict:
@@ -190,6 +220,8 @@ async def finish(state: State, runtime: Runtime[Ctx]) -> dict:
     uses = _tool_uses(last)
     report = next((b.get("input") for b in uses if b["name"] == REPORT), None)
     text = "".join(b.get("text", "") for b in last["content"] if b.get("type") == "text").strip() if isinstance(last["content"], list) else ""
+    # Slack 으로 나가는 글: 전체 호출, 멘션, 글자와 주소가 다른 링크를 풀어 쓴다
+    report, text = clean(report), clean(text)
     out: dict[str, Any] = {"report": report, "answer": None if report else (text or "답을 만들지 못했습니다."),
                            "stopped_by": state.get("stopped_by")}
     if uses:
@@ -203,7 +235,7 @@ async def finish(state: State, runtime: Runtime[Ctx]) -> dict:
 
 async def refused(state: State, runtime: Runtime[Ctx]) -> dict:
     msg = "모델이 이 요청에 대한 답변을 거절함. 질문을 바꾸거나 사람이 직접 확인 필요"
-    data = {"status": "warning", "headline": msg, "impact": [], "causes": [], "actions": [], "data_gaps": []}
+    data = {"status": "warning", "headline": msg, "impact": [], "timeline": [], "causes": [], "actions": [], "data_gaps": [], "references": []}
     # 다음 턴이 이어질 수 있도록 대화를 assistant 응답으로 닫는다
     return {"messages": [{"role": "assistant", "content": msg}], "report": data, "answer": msg, "stopped_by": "refusal"}
 

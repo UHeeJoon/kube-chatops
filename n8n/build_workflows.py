@@ -343,6 +343,9 @@ const foot = { type: 'context', elements: [{ type: 'mrkdwn',
   text: `도구 ${res.body?.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초${stopped}` +
     (res.body?.incident ? ` · 사건 #${res.body.incident.incident_id} 의 ${res.body.incident.report_no}번째 보고 (\`@봇 사건 ${res.body.incident.incident_id}\` 로 전체 보기)` : '') }] };
 const sec = t => ({ type: 'section', text: { type: 'mrkdwn', text: clip(t, 2900) } });
+// 조사 중 읽은 데이터(로그, 요청)에 지시처럼 보이는 문장이 있었으면 사람에게 알린다. 보고서가 그 문장에 휘둘렸을 수 있다.
+const sus = res.body?.injection_suspected ?? [];
+if (sus.length) foot.elements.push({ type: 'mrkdwn', text: `:warning: 조사한 데이터에 *지시처럼 보이는 문장* 이 있었음 (${sus.map(x => '`' + x + '`').join(', ')}). 에이전트는 따르지 않도록 되어 있지만, 결론과 조치 제안을 원본 로그로 한 번 확인하세요.` });
 let blocks = [], text, result;
 if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질문 답, 또는 보고서 없이 글로 끝난 조사
   result = 'answer';
@@ -357,6 +360,7 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
   text = `${label} · ${clip(r.headline, 200)}`;
   blocks.push(sec(`${icon} *${label}* · ${clip(r.headline, 150)}`));
   if (r.impact?.length) blocks.push(sec(`*영향*\n${list(r.impact, 3, 90)}`));
+  if (r.timeline?.length) blocks.push(sec(`*경과*\n${r.timeline.slice(0, 5).map(t => `• \`${clip(t.time, 11)}\` ${clip(t.event, 80)}`).join('\n')}`));
   if (r.causes?.length) {
     const lines = r.causes.slice(0, 2).map((c, i) =>
       `${i + 1}. ${clip(c.title, 90)}  \`${Math.round((c.confidence ?? 0) * 100)}%\`\n` +
@@ -396,6 +400,7 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
       confirm: { title: { type: 'plain_text', text: '격리 파드 삭제' }, confirm: { type: 'plain_text', text: '삭제' }, deny: { type: 'plain_text', text: '취소' },
         text: { type: 'mrkdwn', text: `\`${q.pod}\` 를 지웁니다. 로그와 파일 같은 증거도 함께 사라집니다.` } } }] });
   }
+  if (r.references?.length) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `참고: ${r.references.slice(0, 3).map(x => clip(x, 60)).join(' · ')}` }] });
   blocks.push({ type: 'divider' });
   blocks.push(foot);
 } else if (res.statusCode === 429) {
@@ -409,7 +414,7 @@ return [{ json: { channel: req.channel_id, ts: $('조사 중 표시').item.json.
     mode: req.mode, cost_usd: cost, tool_calls: res.body?.tool_calls ?? 0, stopped_by: res.body?.stopped_by ?? null,
     quarantine: req.quarantine ? `${req.quarantine.pod}:${req.quarantine.done ? 'done' : 'failed'}` : null,
     // 어떤 알림의 조사였는지 (공격 재현 평가 scripts/attack-replay.py 가 보고를 공격과 짝짓는 데 쓴다)
-    incident_id: res.body?.incident?.incident_id ?? null,
+    incident_id: res.body?.incident?.incident_id ?? null, injection_suspected: sus.length,
     alert: req.alert?.alerts?.[0]?.labels?.alertname ?? null,
     alert_pod: req.alert?.alerts?.[0]?.labels?.pod ?? req.alert?.alerts?.[0]?.labels?.source_workload ?? null } } }];
 """

@@ -21,9 +21,11 @@ from opentelemetry import trace
 from prometheus_client import Counter, Histogram
 
 from .config import settings
+from .safety import guard_tool_text
 
 TOOL_CALLS = Counter("agent_tool_calls_total", "에이전트가 부른 MCP 도구 수", ["server", "tool", "status"])
 MCP_UNAVAILABLE = Counter("agent_mcp_unavailable_total", "연결하지 못해 요청에서 뺀 MCP 서버 수", ["server"])
+INJECTION = Counter("agent_injection_suspected_total", "지시처럼 보이는 문장이 든 도구 결과 수", ["server", "tool"])
 TOOL_SECONDS = Histogram("agent_tool_duration_seconds", "MCP 도구 호출 시간", ["server"], buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30))
 tracer = trace.get_tracer("agent.toolbox")
 log = logging.getLogger("agent.toolbox")
@@ -34,6 +36,7 @@ class Toolbox:
         self._stack = AsyncExitStack()
         self._clients: dict[str, Client] = {}
         self.tools: list[dict[str, Any]] = []
+        self.suspicious: list[str] = []  # 이번 요청에서 지시문 의심 문장이 나온 도구 (보고에 표시)
 
     async def __aenter__(self) -> Toolbox:
         await self._stack.__aenter__()
@@ -76,4 +79,9 @@ class Toolbox:
         limit = settings.max_tool_result_chars
         if len(text) > limit:
             text = text[:limit] + "\n...[잘림]"
+        text, hits = guard_tool_text(text)
+        if hits:
+            self.suspicious.append(full_name)
+            INJECTION.labels(server, tool).inc()
+            log.warning("도구 결과에 지시문 의심 문장 %d건: %s", hits, full_name)
         return f"<tool_output>\n{text}\n</tool_output>", is_error
