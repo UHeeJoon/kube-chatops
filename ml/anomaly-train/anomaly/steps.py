@@ -34,6 +34,12 @@ OUTPUTS = Path(os.environ.get("OUTPUTS_DIR", "/tmp/outputs"))
 SCALE_FLOOR = [0.5, 0.01, 0.1, 0.01, 0.005]
 RPS_LOW_QUANTILE = 0.01  # 요청 급감 경계 = 학습 기간 요청 수 1% 지점의 절반
 RPS_LOW_FACTOR = 0.5
+# 부분 급감 경계 = 정상일 때 "한 주기 전 대비 비율" 의 낮은 쪽(0.1% 지점) × 0.8. 실측 0.88 → 0.70.
+# 비율이 정상에서도 이 값 아래로 내려가면 부하에 그 주기가 없는 것이므로 규칙을 끈다.
+DROP_RATIO_QUANTILE = 0.001
+DROP_RATIO_FACTOR = 0.8
+DROP_RATIO_MIN_STABLE = 0.6
+DROP_RATIO_MIN_ROWS = 300
 IFOREST_MIN_Z = 2.0  # IsolationForest 판정은 어느 특성이든 |z| 가 이 값 이상일 때만 인정 (z 한계 4 의 절반)
 CV_BLOCKS = 5
 
@@ -59,6 +65,7 @@ def extract(days: float, prefix: str, history_days: int = 28) -> str:
             print(f"쌓인 데이터 {len(df)}행 (이번에 읽은 것 {fresh_rows}행)")
         except Exception as e:  # noqa: BLE001
             print(f"데이터 쌓기 실패, 이번에 읽은 것만 쓴다: {type(e).__name__}: {e}")
+    df = data.add_prev_cycle(df)
     key = data.put_frame(df, f"{prefix}/dataset.parquet")
     summary = {
         "rows": len(df),
@@ -103,7 +110,7 @@ def split(df: pd.DataFrame, train_frac: float) -> tuple[pd.DataFrame, pd.DataFra
 
 
 def fit_bundle(train: pd.DataFrame, quantile: float, z_limit: float, seed: int = 42) -> dict:
-    x = to_features(train[RAW_COLUMNS])
+    x = to_features(train.reindex(columns=RAW_COLUMNS))
     scaler = StandardScaler().fit(x.to_numpy())  # NaN 은 평균·분산 계산에서 빠진다
     # 거의 변하지 않는 특성(예: 장애가 없던 기간의 error_ratio = 0)은 표준편차가 0 이다.
     # scikit-learn 은 이때 scale_ 을 1 로 바꿔 두므로(z = 원값) scale_ 이 아니라 분산에서 다시 계산하고,
@@ -114,7 +121,19 @@ def fit_bundle(train: pd.DataFrame, quantile: float, z_limit: float, seed: int =
     threshold = float(np.quantile(-forest.score_samples(z), quantile))
     rps_low = float(np.quantile(x["rps"].dropna(), RPS_LOW_QUANTILE) * RPS_LOW_FACTOR)
     return {"scaler": scaler, "forest": forest, "threshold": threshold, "z_limit": z_limit, "rps_low": rps_low,
-            "features": list(FEATURES), "iforest_min_z": IFOREST_MIN_Z}
+            "features": list(FEATURES), "iforest_min_z": IFOREST_MIN_Z, "rps_drop_ratio": drop_ratio(train, rps_low)}
+
+
+def drop_ratio(train: pd.DataFrame, rps_low: float) -> float | None:
+    """정상 구간에서 "한 주기 전 대비 요청 수 비율" 이 얼마나 낮아지는지 보고 부분 급감 경계를 정한다. 정할 수 없으면 None."""
+    if "rps_prev_cycle" not in train:
+        return None
+    prev = pd.to_numeric(train["rps_prev_cycle"], errors="coerce")
+    ratio = (train["rps"] / prev)[prev > rps_low].dropna()
+    if len(ratio) < DROP_RATIO_MIN_ROWS:
+        return None
+    low = float(np.quantile(ratio, DROP_RATIO_QUANTILE))
+    return round(low * DROP_RATIO_FACTOR, 3) if low >= DROP_RATIO_MIN_STABLE else None
 
 
 def cv_false_alarms(normal: pd.DataFrame, quantile: float, z_limit: float) -> dict:
@@ -127,7 +146,7 @@ def cv_false_alarms(normal: pd.DataFrame, quantile: float, z_limit: float) -> di
     minutes = events = 0
     for block in np.array_split(normal.index.to_numpy(), CV_BLOCKS):
         held = normal.loc[block]
-        scored = score_frame(fit_bundle(normal.drop(block), quantile, z_limit), held[RAW_COLUMNS], minute_numbers(held))
+        scored = score_frame(fit_bundle(normal.drop(block), quantile, z_limit), held.reindex(columns=RAW_COLUMNS), minute_numbers(held))
         fa = false_alarms(held["label"], scored["is_anomaly"], minute_numbers(held))
         minutes += fa["false_alarm_minutes"]
         events += fa["false_alarm_events"]
@@ -158,6 +177,8 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         )
         mlflow.log_metric("threshold", bundle["threshold"])
         mlflow.log_metric("rps_low", bundle["rps_low"])
+        if bundle["rps_drop_ratio"] is not None:
+            mlflow.log_metric("rps_drop_ratio", bundle["rps_drop_ratio"])
         normal_all = usable(df)[lambda d: d["label"] == 0]
         cv = cv_false_alarms(normal_all, quantile, z_limit)
         mlflow.log_metrics(cv)
@@ -169,7 +190,8 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "detector.joblib"
             joblib.dump(bundle, path)
-            example = train_df[RAW_COLUMNS].head(3).reset_index(drop=True)
+            # 입력 예시가 모델의 입력 스키마가 된다 (서빙이 이 열들을 요청에서 읽는다). 빈 값이 없는 행을 쓴다
+            example = train_df.reindex(columns=RAW_COLUMNS).astype("float64").fillna(train_df.reindex(columns=RAW_COLUMNS).astype("float64").median()).fillna(0.0).head(3).reset_index(drop=True)
             info = mlflow.pyfunc.log_model(
                 name="model",
                 python_model=MODEL_CODE,
@@ -289,9 +311,10 @@ def replay(new_bundle: dict, champion_bundle: dict) -> dict:
     frame = data.build_dataset(REPLAY_HOURS / 24)
     if frame.empty:
         return {}
+    frame = data.add_prev_cycle(frame)
     minute = minute_numbers(frame)
-    return compare_replay(frame, score_frame(new_bundle, frame[RAW_COLUMNS], minute)["is_anomaly"],
-                          score_frame(champion_bundle, frame[RAW_COLUMNS], minute)["is_anomaly"])
+    return compare_replay(frame, score_frame(new_bundle, frame.reindex(columns=RAW_COLUMNS), minute)["is_anomaly"],
+                          score_frame(champion_bundle, frame.reindex(columns=RAW_COLUMNS), minute)["is_anomaly"])
 
 
 def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
@@ -302,7 +325,7 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
 
     minute = minute_numbers(test)
     new_bundle = _bundle_of(f"models:/{model_id}")
-    scored = score_frame(new_bundle, test[RAW_COLUMNS], minute)
+    scored = score_frame(new_bundle, test.reindex(columns=RAW_COLUMNS), minute)
     model_m = _metrics(y, scored["is_anomaly"])
     base_m = _metrics(y, scored["zscore_anomaly"])  # 기준선: 특성별 z-score 만
     iforest_m = _metrics(y, scored["iforest_anomaly"])  # 참고: IsolationForest 만
@@ -319,7 +342,7 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     try:
         champ = client.get_model_version_by_alias(MODEL_NAME, "champion")
         champion_bundle = _bundle_of(f"models:/{MODEL_NAME}@champion")
-        champ_scored = score_frame(champion_bundle, test[RAW_COLUMNS], minute)
+        champ_scored = score_frame(champion_bundle, test.reindex(columns=RAW_COLUMNS), minute)
         champion_f1 = _metrics(y, champ_scored["is_anomaly"])["f1"]
         champion_fa = false_alarms(y, champ_scored["is_anomaly"], minute)["false_alarm_minutes"]
         print(f"champion v{champ.version} f1={champion_f1} false_alarm_minutes={champion_fa}")

@@ -5,7 +5,7 @@
 
 입력: 1분 단위 행. 열은 RAW_COLUMNS (Prometheus 에서 읽은 값 그대로).
 출력: 행마다 이상 점수(클수록 이상), 이상 여부, 가장 크게 벗어난 특성과 그 z-score, 특성별 z-score(z_<특성>, 부호 있음),
-      요청 급감 여부(traffic_drop).
+      요청 급감 여부(traffic_drop), 한 주기 전 대비 요청 수 비율(rps_vs_prev_cycle).
 
 행은 시간 순서의 연속된 분으로 넣는다 (v7 은 IsolationForest 단독 판정에 이웃한 분을 본다).
 """
@@ -18,7 +18,9 @@ import numpy as np
 import pandas as pd
 from mlflow.pyfunc import PythonModel
 
-RAW_COLUMNS = ["rps", "error_ratio", "p95_seconds", "mem_ratio", "mem_growth"]
+# rps_prev_cycle 은 특성이 아니라 급감 규칙의 기준값이다 (한 주기 전 같은 시점의 요청 수). 없거나 비면 그 규칙만 쉰다.
+RAW_COLUMNS = ["rps", "error_ratio", "p95_seconds", "mem_ratio", "mem_growth", "rps_prev_cycle"]
+_FEATURE_INPUTS = ["rps", "error_ratio", "p95_seconds", "mem_ratio", "mem_growth"]
 FEATURES = ["rps", "error_ratio", "p95_log_ms", "mem_ratio", "mem_growth"]
 
 
@@ -30,7 +32,7 @@ def to_features(raw: pd.DataFrame) -> pd.DataFrame:
     - p95, mem_ratio, mem_growth: 비면 '측정 못 함' (수집 중단, 재시작 직후) → 비워 두고, 점수 계산 때 평소 값(z=0)으로 본다.
       0 으로 채우면 '메모리 0%' 로 읽혀 수집이 끊긴 순간이 이상으로 잡힌다 (11-26 실제로 겪음).
     """
-    num = {c: pd.to_numeric(raw[c], errors="coerce") for c in RAW_COLUMNS}
+    num = {c: pd.to_numeric(raw[c], errors="coerce") for c in _FEATURE_INPUTS}
     return pd.DataFrame(
         {
             "rps": num["rps"].fillna(0.0).clip(lower=0),
@@ -79,7 +81,18 @@ def score_frame(bundle: dict, raw: pd.DataFrame, minute: np.ndarray | None = Non
     # 요청 급감: 요청 수는 평소에도 시간대에 따라 크게 오르내려(표준편차가 큼) z-score 의 아래 경계가 음수다.
     # 그래서 0 으로 떨어져도 z 로는 못 잡는다. 학습 기간의 낮은 쪽(1% 지점)의 절반 아래면 이상으로 본다.
     rps_low = bundle.get("rps_low")  # v5 이전 모델에는 없다
-    drop = (feats["rps"].to_numpy() < rps_low) if rps_low is not None else np.zeros(len(feats), dtype=bool)
+    rps = feats["rps"].to_numpy()
+    drop = (rps < rps_low) if rps_low is not None else np.zeros(len(feats), dtype=bool)
+    # 부분 급감 (v10~): 위 경계는 평소의 낮은 쪽보다도 낮아야 걸려, 요청이 절반으로 줄어도 못 잡는다 (11-28 시험: 4.8 → 1.7 rps 를 8분 동안 놓침).
+    # 부하에 주기가 있으면(데모는 1시간) "최근 N분 중앙값 대비" 는 쓸 수 없다. 정상일 때도 0.41 까지 내려간다.
+    # 한 주기 전 같은 시점과 비교하면 정상은 0.88 이상, 절반 급감은 0.5 로 갈린다. 기준값은 호출하는 쪽이 rps_prev_cycle 로 준다.
+    ratio = np.full(len(feats), np.nan)
+    drop_ratio = bundle.get("rps_drop_ratio")
+    if drop_ratio is not None and "rps_prev_cycle" in raw:
+        prev = pd.to_numeric(raw["rps_prev_cycle"], errors="coerce").to_numpy(dtype=float)
+        ok = np.isfinite(prev) & (prev > (rps_low or 0.0))  # 기준 시점이 거의 0 이었으면(그때가 장애) 비교하지 않는다
+        ratio[ok] = rps[ok] / prev[ok]
+        drop = drop | (np.nan_to_num(ratio, nan=1.0) < drop_ratio)
     # IsolationForest 단독 판정은 근거가 약하다: 어느 특성도 크게 벗어나지 않았는데 조합이 드물다는 뜻이다.
     # 11-27 분석 (시간 순 분할 12회, 정상 5,538분): 오탐 102분이 전부 IsolationForest 단독이었고 최대 z 가 1.4 이하였다
     # (요청이 평소보다 조금 적은 시간대). 같은 방식으로 잡은 진짜 장애는 분할마다 1~2분뿐.
@@ -105,6 +118,7 @@ def score_frame(bundle: dict, raw: pd.DataFrame, minute: np.ndarray | None = Non
             "traffic_drop": drop,
             "top_feature": top_names,
             "top_z": abs_z.max(axis=1).round(2),
+            "rps_vs_prev_cycle": ratio.round(2),
             # 특성별 z (부호: + 평소보다 큼, - 작음). 대시보드에서 "왜 이상인지" 를 보여 주는 데 쓴다
             **{f"z_{f}": z[:, i].round(2) for i, f in enumerate(names)},
         },

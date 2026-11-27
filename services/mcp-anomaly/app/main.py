@@ -24,6 +24,7 @@ from prometheus_client import Counter, Gauge
 from mcp_common import ToolInputError, instrumented, serve, to_json
 
 from .features import FEATURE_QUERIES
+from .pods import POD_QUERIES, pod_findings, pod_rows
 
 PROM_URL = os.environ.get("PROMETHEUS_URL", "http://kube-prometheus-kube-prome-prometheus.monitoring.svc:9090")
 MODEL_URL = os.environ.get(
@@ -66,6 +67,31 @@ def _parse_range(body: dict) -> dict[int, float | None]:
 async def _range(query: str, start: float, end: float) -> dict[int, float | None]:
     resp = await prom.get("/api/v1/query_range", params=_range_params(query, start, end))
     return _parse_range(resp.json())
+
+
+def _parse_by_pod(body: dict) -> dict[str, float | None]:
+    if body.get("status") != "success":
+        raise ToolInputError(f"Prometheus 오류: {body.get('errorType')}: {body.get('error')}")
+    return {r["metric"].get("pod", ""): _num(r["value"][1]) for r in body["data"]["result"]}
+
+
+async def _pods_now(at: int) -> dict | None:
+    """마지막 분의 파드별 값을 모델로 채점한다. 실패해도 도구 전체를 실패시키지 않는다 (서비스 합계 판정이 본래의 답이다)."""
+    try:
+        series = {}
+        for name, q in POD_QUERIES.items():
+            resp = await prom.get("/api/v1/query", params={"query": q, "time": at, "timeout": "20s"})
+            series[name] = _parse_by_pod(resp.json())
+        rows = pod_rows(series)
+        if len(rows) < 2:
+            return None
+        resp = await model.post(MODEL_URL, json={"instances": [r for _, r in rows]})
+        if resp.status_code != 200:
+            return None
+        return pod_findings(rows, resp.json()["predictions"])
+    except Exception as e:  # noqa: BLE001
+        log.warning("pod scoring failed: %s: %s", type(e).__name__, e)
+        return None
 
 
 KST = timezone(timedelta(hours=9))
@@ -115,7 +141,7 @@ async def detect_anomalies(minutes: int = 60) -> str:
     """demo 서비스의 최근 `minutes` 분(5~360)을 이상 탐지 모델로 검사한다.
 
     돌려주는 것: 이상으로 판정된 분 수, 이상 구간 목록(시작·끝 KST, 주된 지표, 최대 z-score, 구간 최댓값),
-    지금(마지막 분) 상태, 모델 버전. main_signal 은 error_ratio(오류율), p95_log_ms(지연), mem_ratio(메모리), rps(요청 수) 중 하나.
+    지금(마지막 분) 상태, 모델 버전, pods(지금 파드별로 따로 채점했을 때 이상인 파드. 일부 파드만 이상이면 그 파드의 문제다). main_signal 은 error_ratio(오류율), p95_log_ms(지연), mem_ratio(메모리), rps(요청 수) 중 하나.
     z-score 는 평소(학습 기간) 대비 몇 표준편차 벗어났는지다. 4 이상이면 이상으로 본다.
     """
     if not 5 <= minutes <= MAX_MINUTES:
@@ -134,8 +160,10 @@ async def detect_anomalies(minutes: int = 60) -> str:
     preds = body["predictions"]
     segs = segments(rows, preds)
     last, last_p = rows[-1], preds[-1]
+    pods = await _pods_now(stamps[-1])
     return to_json(
         {
+            **({"pods": pods} if pods else {}),
             "window": f"{_kst(stamps[0])} ~ {_kst(stamps[-1])} (KST, 1분 단위 {len(rows)}개)",
             "anomalous_minutes": sum(1 for p in preds if p["is_anomaly"]),
             "segments": segs[-10:],
@@ -155,9 +183,32 @@ async def detect_anomalies(minutes: int = 60) -> str:
 M_ANOMALY = Gauge("anomaly_model_is_anomaly", "마지막 1분 이상 판정 (1=이상)", ["rule"])  # rule: hybrid | iforest | zscore
 M_SCORE = Gauge("anomaly_model_score", "마지막 1분 IsolationForest 이상 점수 (클수록 이상)")
 M_Z = Gauge("anomaly_model_feature_z", "마지막 1분 특성별 z-score (평소 대비 표준편차, 부호 있음)", ["feature"])
+M_POD_Z = Gauge("anomaly_model_pod_z", "따로 채점했을 때 이상인 파드의 가장 크게 벗어난 특성 z (이상인 파드만)", ["pod", "feature"])
+M_RPS_RATIO = Gauge("anomaly_model_rps_vs_prev_cycle", "마지막 1분 요청 수 / 한 주기(1시간) 전 같은 시점의 요청 수")
 M_INFO = Gauge("anomaly_model_info", "지금 서빙 중인 모델 (값은 항상 1)", ["model_version"])
 M_RUNS = Counter("anomaly_monitor_runs_total", "모니터 판정 횟수", ["status"])
 M_LAST = Gauge("anomaly_monitor_last_success_timestamp_seconds", "마지막 판정 성공 시각")
+
+
+def _monitor_pods(prom_sync: httpx2.Client, model_sync: httpx2.Client, at: int) -> None:
+    """파드별 판정을 메트릭으로. 서비스 합계 판정(hybrid)과 따로 둔다: rule="pod" 는 어느 파드든 하나라도 이상이면 1."""
+    try:
+        series = {
+            name: _parse_by_pod(prom_sync.get("/api/v1/query", params={"query": q, "time": at, "timeout": "20s"}).json())
+            for name, q in POD_QUERIES.items()
+        }
+        rows = pod_rows(series)
+        found = None
+        if len(rows) >= 2:
+            resp = model_sync.post(MODEL_URL, json={"instances": [r for _, r in rows]})
+            resp.raise_for_status()
+            found = pod_findings(rows, resp.json()["predictions"])
+        M_POD_Z.clear()  # 사라진 파드의 값이 남지 않게
+        for f in (found or {}).get("anomalous", []):
+            M_POD_Z.labels(f["pod"], f["main_signal"]).set(f["z"])
+        M_ANOMALY.labels("pod").set(int(bool(found and found["anomalous"])))
+    except Exception as e:  # noqa: BLE001 — 파드별 판정 실패가 서비스 판정을 막으면 안 된다
+        log.warning("pod monitor failed: %s: %s", type(e).__name__, e)
 
 
 def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
@@ -183,10 +234,13 @@ def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
     M_ANOMALY.labels("zscore").set(int(p["zscore_anomaly"]))
     if "traffic_drop" in p:  # v6 부터: 요청 급감 규칙
         M_ANOMALY.labels("traffic_drop").set(int(p["traffic_drop"]))
+    if p.get("rps_vs_prev_cycle") is not None:  # v10 부터: 한 주기(1시간) 전 같은 시점 대비 요청 수
+        M_RPS_RATIO.set(p["rps_vs_prev_cycle"])
     M_SCORE.set(p["score"])
     for k, v in p.items():  # 예전 모델(v1)은 z_<특성> 이 없다
         if k.startswith("z_") and v is not None:
             M_Z.labels(k.removeprefix("z_")).set(v)
+    _monitor_pods(prom_sync, model_sync, end)
     version = body.get("model_version") or "unknown"
     M_INFO.clear()
     M_INFO.labels(version).set(1)

@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
-from anomaly import steps
+from anomaly import data, steps
 from anomaly.detector_model import FEATURES, RAW_COLUMNS, score_frame, to_features
 
 
@@ -49,7 +49,7 @@ def test_error_spike_detected_even_when_error_was_constant_in_training():
     """학습 기간에 오류율이 늘 0 이면 IsolationForest 는 오류율을 못 본다 → z-score 가 잡아야 한다."""
     train, test = steps.split(synthetic(), 0.7)
     bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
-    scored = score_frame(bundle, test[RAW_COLUMNS])
+    scored = score_frame(bundle, test.reindex(columns=RAW_COLUMNS))
     errors = (test["kind"] == "error").to_numpy()
     assert scored.loc[errors, "is_anomaly"].all()
     assert (scored.loc[errors, "top_feature"] == "error_ratio").all()
@@ -60,7 +60,7 @@ def test_error_spike_detected_even_when_error_was_constant_in_training():
 def test_few_false_alarms_on_normal_minutes():
     train, test = steps.split(synthetic(), 0.7)
     bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
-    scored = score_frame(bundle, test[RAW_COLUMNS])
+    scored = score_frame(bundle, test.reindex(columns=RAW_COLUMNS))
     normal = (test["label"] == 0).to_numpy()
     assert scored.loc[normal, "is_anomaly"].mean() < 0.05
 
@@ -85,7 +85,7 @@ def test_per_feature_z_explains_the_decision():
     """대시보드용 특성별 z: 지연 장애에서는 p95 z 가 크게 양수, 나머지는 작다."""
     train, test = steps.split(synthetic(), 0.7)
     bundle = steps.fit_bundle(train, quantile=0.999, z_limit=4.0)
-    scored = score_frame(bundle, test[RAW_COLUMNS])
+    scored = score_frame(bundle, test.reindex(columns=RAW_COLUMNS))
     latency = (test["kind"] == "latency").to_numpy()
     assert (scored.loc[latency, "z_p95_log_ms"] > 4).all()
     assert (scored.loc[latency, "z_error_ratio"].abs() < 4).all()
@@ -219,12 +219,12 @@ def test_false_alarms_report_sample_size_and_events():
 def test_older_model_with_fewer_features_still_scores():
     """evaluate 단계는 새 코드로 이전 챔피언(v5, 특성 4개)도 점수 낸다 (11-27 v6 학습에서 겪음: X has 5 features)."""
     train, test = steps.split(synthetic(), 0.7)
-    four = to_features(train[RAW_COLUMNS])[FEATURES[:4]]
+    four = to_features(train.reindex(columns=RAW_COLUMNS))[FEATURES[:4]]
     scaler = StandardScaler().fit(four)
     v5 = {**steps.fit_bundle(train, quantile=0.999, z_limit=4.0), "scaler": scaler,
           "forest": IsolationForest(random_state=0).fit(scaler.transform(four))}
     del v5["features"]  # v5 번들에는 특성 목록이 없다
-    out = score_frame(v5, test[RAW_COLUMNS])
+    out = score_frame(v5, test.reindex(columns=RAW_COLUMNS))
     assert len(out) == len(test) and "z_mem_growth" not in out.columns
 
 
@@ -263,7 +263,7 @@ def test_episodes_count_incidents_and_delay():
     out = steps.episodes(test, pred, minute)
     assert out["episodes"] == 2 and out["episodes_detected"] == 1 and out["episodes_missed_kinds"] == "error"
     assert out["detect_late_minutes_median"] == 4.0
-    scored = score_frame(steps.fit_bundle(steps.split(df, 0.7)[0], 0.999, 4.0), test[RAW_COLUMNS], minute)
+    scored = score_frame(steps.fit_bundle(steps.split(df, 0.7)[0], 0.999, 4.0), test.reindex(columns=RAW_COLUMNS), minute)
     real = steps.episodes(test, scored["is_anomaly"], minute)
     assert real["episodes_detected"] == 2 and real["detect_late_minutes_max"] == 0.0
 
@@ -289,3 +289,59 @@ def test_compare_replay_separates_trouble_from_quiet():
     assert out["replay_only_new_in_trouble"] == 1 and out["replay_only_new_in_quiet"] == 1
     assert out["replay_only_champion_in_trouble"] == 1 and out["replay_only_champion_in_quiet"] == 1
     assert out["replay_minutes"] == 10 and out["replay_new_anomaly_minutes"] == 3
+
+
+# ── 부분 급감: 한 주기(1시간) 전 같은 시점 대비 ──
+
+
+def cyclic(minutes: int = 1500, drop_at: tuple[int, int] | None = None, factor: float = 0.5) -> pd.DataFrame:
+    """요청 수가 1시간 주기로 2.5~7.5 를 오르내리는 데이터 (데모 부하와 같은 모양)."""
+    rng = np.random.default_rng(3)
+    df = synthetic(minutes)
+    df["label"], df["kind"] = 0, ""
+    df["p95_seconds"], df["error_ratio"] = 0.0095, 0.0
+    df["rps"] = 5 + 2.5 * np.sin(np.arange(minutes) * 2 * np.pi / 60) + rng.normal(0, 0.05, minutes)
+    if drop_at:
+        a, b = drop_at
+        df.loc[a:b, "rps"] *= factor
+        df.loc[a:b, ["label", "kind"]] = [1, "traffic_drop"]
+    return data.add_prev_cycle(df)
+
+
+def test_prev_cycle_is_the_same_minute_one_cycle_ago():
+    df = cyclic()
+    later = df.iloc[200:]
+    assert ((later["rps"] / later["rps_prev_cycle"]).between(0.9, 1.1)).all()
+    assert df["rps_prev_cycle"].iloc[:55].isna().all()  # 한 주기가 차기 전에는 기준이 없다
+
+
+def test_half_traffic_drop_is_caught_but_the_cycle_low_is_not():
+    """요청이 절반으로 줄면 잡는다. 주기의 낮은 쪽(평소의 절반 수준)은 한 주기 전에도 낮았으므로 잡지 않는다."""
+    df = cyclic(drop_at=(1300, 1320))
+    bundle = steps.fit_bundle(df[df["label"] == 0].iloc[:1000], 0.999, 4.0)
+    assert 0.6 <= bundle["rps_drop_ratio"] <= 0.8
+    scored = score_frame(bundle, df.reindex(columns=RAW_COLUMNS))
+    assert scored.loc[1300:1320, "traffic_drop"].all()
+    assert scored.loc[1300:1320, "top_feature"].eq("rps").all()
+    quiet = scored[df["label"] == 0].iloc[100:]
+    assert not quiet["traffic_drop"].any()
+    assert df.loc[df["label"] == 0, "rps"].min() < 2.6  # 낮은 쪽은 실제로 평소 평균의 절반이다
+
+
+def test_ratio_rule_is_off_without_a_stable_cycle_or_baseline():
+    """주기가 없는 부하(비율이 정상에서도 크게 흔들림)에서는 규칙을 끄고, 기준값이 없는 요청은 이 규칙으로 판정하지 않는다."""
+    df = synthetic(1500)
+    df["rps"] = np.random.default_rng(5).uniform(1, 9, len(df))
+    assert steps.fit_bundle(data.add_prev_cycle(df), 0.999, 4.0)["rps_drop_ratio"] is None
+    cyc = cyclic()
+    bundle = steps.fit_bundle(cyc.iloc[:1000], 0.999, 4.0)
+    row = pd.DataFrame([{"rps": 2.0, "error_ratio": 0.0, "p95_seconds": 0.0095, "mem_ratio": 0.138, "mem_growth": 0.0, "rps_prev_cycle": None}])
+    assert not score_frame(bundle, row)["traffic_drop"].iloc[0]
+    row["rps_prev_cycle"] = 5.0
+    assert score_frame(bundle, row)["traffic_drop"].iloc[0]
+
+
+def test_models_before_the_ratio_rule_ignore_the_new_column():
+    cyc = cyclic(drop_at=(1300, 1320))
+    old = {k: v for k, v in steps.fit_bundle(cyc.iloc[:1000], 0.999, 4.0).items() if k != "rps_drop_ratio"}
+    assert not score_frame(old, cyc.reindex(columns=RAW_COLUMNS))["traffic_drop"].any()

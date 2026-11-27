@@ -40,6 +40,9 @@ jobs:
       - name: 이상 탐지 모델 단위 테스트 (합성 데이터)
         working-directory: ml/anomaly-train
         run: python -m pytest -q tests
+      - name: 파드별 채점 단위 테스트 (의존성 없는 모듈)
+        working-directory: services/mcp-anomaly
+        run: python -m pytest -q tests
       - run: pip install -r ml/anomaly-serve/requirements.txt
       - name: 서빙 계약 시험 (학습이 만든 모델 → 서빙 코드 → mcp-anomaly 요청 모양)
         working-directory: ml/anomaly-serve

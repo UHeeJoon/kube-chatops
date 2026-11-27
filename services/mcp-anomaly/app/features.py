@@ -27,4 +27,7 @@ FEATURE_QUERIES = {
         ' / max by (pod) (kube_pod_container_resource_limits{namespace="demo", container="app", resource="memory"})'
         ' and on (pod) (time() - max by (pod) (kube_pod_container_state_started{namespace="demo", container="app"}) > 300))'
     ),
+    # 한 주기(1시간) 전 같은 시점의 요청 수: 63~58분 전의 평균. 요청 급감을 "평소 이 시점 대비 비율" 로 보는 기준값이다.
+    # 데모 부하는 1시간 주기다 (60분 간격 자기상관 0.87). 한 점만 쓰면 정상에서도 비율이 0.59 까지 흔들려 5분 평균을 쓴다.
+    "rps_prev_cycle": f'avg_over_time((sum(rate(http_requests_total{{namespace="demo", {PATH_FILTER}}}[2m])))[5m:1m] offset 58m)',
 }

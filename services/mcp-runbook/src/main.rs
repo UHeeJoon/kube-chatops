@@ -160,13 +160,19 @@ impl App {
                 let results: Vec<Value> = hits
                     .iter()
                     .map(|h| {
-                        json!({
+                        // 모델이 쓰지 않는 값은 싣지 않는다: 점수(순서가 이미 순위다), 런북의 meta(파일 이름뿐이고 source 에 있다), tainted=false.
+                        let mut hit = json!({
                             "document_id": h.document_id, "title": h.title, "source": h.source, "section": h.heading,
-                            "trust": trust_of(kind), "tainted": h.meta.get("tainted").and_then(Value::as_bool).unwrap_or(false),
-                            "text": clip(&h.content, SNIPPET_CHARS), "meta": h.meta,
-                            "score": (h.score * 10000.0).round() / 10000.0,
+                            "trust": trust_of(kind), "text": clip(&h.content, SNIPPET_CHARS),
                             "matched_by": match (h.vector_rank, h.text_rank) { (Some(_), Some(_)) => "뜻과 낱말", (Some(_), None) => "뜻", _ => "낱말" },
-                        })
+                        });
+                        if h.meta.get("tainted").and_then(Value::as_bool).unwrap_or(false) {
+                            hit["tainted"] = json!(true);
+                        }
+                        if kind != "runbook" {
+                            hit["meta"] = h.meta.clone();
+                        }
+                        hit
                     })
                     .collect();
                 json!({ "query": query, "count": results.len(), "results": results,

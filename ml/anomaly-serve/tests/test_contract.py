@@ -32,7 +32,7 @@ def _load(path: Path, name: str):
 
 FEATURE_QUERIES = _load(ROOT / "services" / "mcp-anomaly" / "app" / "features.py", "mcp_features").FEATURE_QUERIES
 # mcp-anomaly 가 응답에서 읽는 필드 (services/mcp-anomaly/app/main.py 의 segments, detect_anomalies, monitor_once)
-READ_BY_MCP = ["is_anomaly", "iforest_anomaly", "zscore_anomaly", "traffic_drop", "top_feature", "top_z", "score"]
+READ_BY_MCP = ["is_anomaly", "iforest_anomaly", "zscore_anomaly", "traffic_drop", "top_feature", "top_z", "score", "rps_vs_prev_cycle"]
 
 
 @pytest.fixture(scope="module")
@@ -41,18 +41,19 @@ def served(tmp_path_factory) -> AnomalyModel:
     n = 600
     train = pd.DataFrame({"rps": 5 + rng.normal(0, 0.5, n), "error_ratio": np.zeros(n), "p95_seconds": 0.0095 + rng.normal(0, 0.0003, n),
                           "mem_ratio": 0.138 + rng.normal(0, 0.001, n), "mem_growth": np.abs(rng.normal(0, 0.0002, n))})
+    train["rps_prev_cycle"] = train["rps"] * (1 + rng.normal(0, 0.02, n))
     tmp = tmp_path_factory.mktemp("model")
     joblib.dump(steps.fit_bundle(train, 0.999, 4.0), tmp / "detector.joblib")
     # 학습 단계(steps.train)와 같은 방식으로 저장한다: 모델 코드 파일 + bundle + 입력 예시(→ 입력 스키마)
     mlflow.pyfunc.save_model(path=str(tmp / "served"), python_model=steps.MODEL_CODE, artifacts={"detector": str(tmp / "detector.joblib")},
-                             input_example=train[RAW_COLUMNS].head(3), pip_requirements=steps._pip_requirements())
+                             input_example=train.reindex(columns=RAW_COLUMNS).head(3), pip_requirements=steps._pip_requirements())
     model = AnomalyModel("demo-anomaly", str(tmp / "served"))
     model.load()
     return model
 
 
 def row(**over):
-    base = {"rps": 5.0, "error_ratio": 0.0, "p95_seconds": 0.0095, "mem_ratio": 0.138, "mem_growth": 0.0001}
+    base = {"rps": 5.0, "error_ratio": 0.0, "p95_seconds": 0.0095, "mem_ratio": 0.138, "mem_growth": 0.0001, "rps_prev_cycle": 5.0}
     return {k: {**base, **over}.get(k) for k in FEATURE_QUERIES}
 
 
@@ -71,6 +72,13 @@ def test_request_shaped_like_mcp_anomaly_is_answered(served):
         assert any(k.startswith("z_") for k in p)
     assert [p["is_anomaly"] for p in preds] == [False, False, True, True, True]
     assert preds[2]["top_feature"] == "p95_log_ms" and preds[3]["top_feature"] == "error_ratio" and preds[4]["traffic_drop"]
+
+
+def test_half_traffic_drop_needs_the_baseline_the_detector_sends(served):
+    """요청이 절반이 되면 한 주기 전 값(rps_prev_cycle)과 비교해 잡는다. 그 값이 비어 오면(Prometheus 에 한 시간 전 데이터 없음) 판정하지 않는다."""
+    preds = served.predict({"instances": [row(rps=2.5), row(rps=2.5, rps_prev_cycle=None), row(rps=2.5, rps_prev_cycle=2.6)]})["predictions"]
+    assert [p["traffic_drop"] for p in preds] == [True, False, False]
+    assert preds[0]["rps_vs_prev_cycle"] == 0.5 and preds[1]["rps_vs_prev_cycle"] is None and preds[0]["top_feature"] == "rps"
 
 
 def test_integer_values_and_json_bytes_are_accepted(served):
