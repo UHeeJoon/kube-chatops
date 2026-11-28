@@ -155,6 +155,11 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
     now = datetime.now(ZoneInfo(settings.budget_timezone)).strftime("%Y-%m-%d %H:%M %Z")
     kind = "질문 (짧게 답하기)" if _is_answer(state) else "조사 (원인을 찾아 submit_report 로 보고)"
     parts = [f"요청 종류: {kind}", f"현재 시각: {now}", f"질문: {state['question']}"]
+    if _is_answer(state):  # "오늘 비용 얼마 썼어" 에 답할 수단이 없어 제공자 콘솔을 보라고 답했다 (11-28)
+        try:
+            parts.insert(2, f"오늘 LLM 비용: ${await runtime.context.ledger.spent_today():.2f} (하루 한도 ${settings.daily_budget_usd:.2f})")
+        except Exception:  # noqa: BLE001  비용 줄이 없다고 답을 막지는 않는다
+            pass
     # 앞의 실행이 도구 호출 도중에 끊겼으면(파드 재시작, 시간 초과) 대화가 결과 없는 tool_use 로 끝나 있다. 그 위에 새 메시지를 붙이면
     # API 가 거절해 이 스레드는 다시 쓸 수 없게 된다. 실행되지 않았다는 결과를 채워 대화를 이어 갈 수 있게 한다.
     dangling = _tool_uses(state["messages"][-1]) if state.get("messages") and state["messages"][-1].get("role") == "assistant" else []

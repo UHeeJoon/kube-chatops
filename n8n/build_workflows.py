@@ -171,7 +171,7 @@ if (res.statusCode === 200) {
   if (intent === 'investigate' || intent === 'query') next = 'investigate';
   if (intent === 'query') mode = 'answer';
   else if (intent === 'mlops') next = 'mlops';
-  else if (intent === 'action_request') reply = '조치 실행은 조사 보고서의 승인 버튼으로만 할 수 있습니다 (승인 흐름 준비 중). 먼저 무엇이 문제인지 물어봐 주세요.';
+  else if (intent === 'action_request') reply = '조치는 조사 보고서에 붙는 승인 버튼으로만 실행합니다 (말로 요청한 조치는 실행하지 않습니다). 먼저 무엇이 문제인지 물어봐 주세요. 예: demo-app 왜 재시작해?';
   else reply = res.body.reply || '네.';
 } else if (res.statusCode === 429) {
   reply = '오늘 AI 사용 예산을 다 썼습니다. 내일 다시 시도해 주세요.';

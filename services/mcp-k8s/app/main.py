@@ -171,7 +171,9 @@ async def describe_deployment(name: str, namespace: str = "demo") -> str:
 @server.tool()
 @instrumented
 async def rollout_history(name: str, namespace: str = "demo") -> str:
-    """Deployment 의 롤아웃 이력 (ReplicaSet 리비전별 이미지, 생성 시각, 현재 복제본 수). 최근 배포가 장애와 겹치는지 볼 때 쓴다."""
+    """Deployment 의 롤아웃 이력 (ReplicaSet 리비전별 이미지, 생성 시각, 현재 복제본 수). 최근 배포가 장애와 겹치는지 볼 때 쓴다.
+
+    마지막 배포 시각은 last_rollout 이다. 리비전의 created 는 ReplicaSet 을 처음 만든 시각이라, 롤백으로 다시 쓰인 리비전에서는 배포 시각이 아니다."""
     ns, name = check_namespace(namespace), _name(name)
     d = await _call(apps.read_namespaced_deployment, name, ns)
     selector = ",".join(f"{k}={v}" for k, v in (d.spec.selector.match_labels or {}).items())
@@ -193,7 +195,18 @@ async def rollout_history(name: str, namespace: str = "demo") -> str:
             }
         )
     rows.sort(key=lambda r: r["revision"], reverse=True)
-    return to_json({"deployment": name, "current_revision": (d.metadata.annotations or {}).get("deployment.kubernetes.io/revision"), "history": rows[:10]})
+    out: dict = {"deployment": name, "current_revision": (d.metadata.annotations or {}).get("deployment.kubernetes.io/revision")}
+    # 롤백하면 예전 ReplicaSet 이 새 리비전 번호를 받는다. 그 created 는 처음 만든 시각이라 "최근 배포 시각" 으로 읽으면 틀린다
+    # (11-28: 04:3x 에 롤백한 rev 7 을 "11-27 19:45 배포" 라고 답했다). 실제로 마지막에 롤아웃이 끝난 시각은 Progressing 조건에 있다.
+    progressing = next((c for c in (d.status.conditions or []) if c.type == "Progressing"), None)
+    if progressing is not None and progressing.last_update_time is not None:
+        out["last_rollout"] = {"at": progressing.last_update_time, "age": _age(progressing.last_update_time), "reason": progressing.reason}
+    if rows and any(r["created"] and rows[0]["created"] and r["created"] > rows[0]["created"] for r in rows[1:]):
+        rows[0]["reused"] = True
+        out["note"] = (f"현재 리비전 {rows[0]['revision']} 은 예전 ReplicaSet 을 다시 쓴 것입니다 (롤백). 그 created 는 배포 시각이 아니며, "
+                       "마지막 롤아웃 시각은 last_rollout.at 입니다. 그보다 늦게 만들어진 리비전이 직전에 시도된 배포입니다.")
+    out["history"] = rows[:10]
+    return to_json(out)
 
 
 if __name__ == "__main__":
