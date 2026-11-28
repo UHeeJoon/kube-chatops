@@ -58,7 +58,11 @@ client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_
 
 # 거절(refusal) 시 같은 요청을 다른 모델로 자동 재시도 (서버 측 fallback, 카테고리별 기본 경로).
 # Haiku 에는 서버 측 fallback 이 없어서 붙이지 않는다.
-FALLBACK = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
+# thinking 블록은 그것이 만들어진 대화(system·tools·앞의 메시지)에 묶여 있다. 배포로 프롬프트나 도구가 바뀌면 그 전에 시작한
+# 스레드의 블록은 "다른 대화의 것" 이 되어 API 가 400 으로 거절한다 (11-28: 배포 뒤 기존 스레드의 후속 질문이 모두 agent 500).
+# drop_block: 맞지 않는 블록만 버리고 계속한다. 그 턴의 생각만 잃고 대화 내용(글, 도구 결과)은 그대로다.
+FALLBACK = {"betas": ["server-side-fallback-2026-07-01", "thinking-binding-controls-2026-08-01"], "fallbacks": "default",
+            "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}}
 
 # 시스템 프롬프트 끝에 캐시 지점 고정 (도구 + 시스템을 모든 요청이 공유)
 # 도구 정의와 시스템 프롬프트는 요청마다 같다 → 여기까지를 길게(기본 1시간) 캐시한다. 대화 쪽 자동 캐시(5분)보다 앞에 있어야 한다.
