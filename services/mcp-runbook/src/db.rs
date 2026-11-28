@@ -257,10 +257,12 @@ pub async fn search(pool: &PgPool, kind: &str, query: &str, embedding: &[f32], l
            order by c.embedding <=> $1::vector
            limit $5
          ), txt as (
-           select c.id, row_number() over (order by ts_rank(c.tsv, q) desc, c.id) as rank
+           -- 낱말 점수는 같은 낱말이 한 번씩 든 구역끼리 정확히 같아지는 일이 흔하다. 동점을 문서 번호로 가르면 순위가 넣은 순서에 좌우된다
+           -- (11-28: 다시 색인해 번호가 바뀌자 떼어 둔 질문의 1순위 적중이 0.81 → 0.69 로 떨어졌다). 동점은 뜻이 가까운 쪽을 앞에 둔다.
+           select c.id, row_number() over (order by ts_rank(c.tsv, q) desc, c.embedding <=> $1::vector, c.id) as rank
            from chunks c join documents d on d.id = c.document_id, to_tsquery('simple', nullif($3, '')) q
            where d.kind = $2 and c.tsv @@ q
-           order by ts_rank(c.tsv, q) desc, c.id
+           order by ts_rank(c.tsv, q) desc, c.embedding <=> $1::vector, c.id
            limit $5
          ), fused as (
            select coalesce(vec.id, txt.id) as id,
