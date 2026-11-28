@@ -210,6 +210,30 @@ pub async fn lookup(pool: &PgPool, kind: &str, value: &str, limit: i64) -> Resul
     Ok((stats, rows))
 }
 
+/// 가장 최근 사건부터 시간순으로, 사건마다 가장 최근 보고 하나씩.
+///
+/// "가장 최근 장애가 뭐였나" 는 비슷한 글 찾기로 답할 수 없다 (11-28: 질문과 글이 닮은 옛 사건을 "최근" 이라고 답했다).
+/// 문제 없음(ok)으로 끝난 조사는 장애가 아니므로 뺀다.
+pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<Related>> {
+    let rows = sqlx::query_as::<_, Related>(
+        "select document_id, title, source, meta, recorded_at, reports, ongoing from (
+           select distinct on (inc) id as document_id, title, source, meta, updated_at,
+                  to_char(updated_at at time zone 'Asia/Seoul', 'YYYY-MM-DD HH24:MI') as recorded_at,
+                  count(*) over (partition by inc) as reports,
+                  max(updated_at) over (partition by inc) > now() - make_interval(mins => $2) as ongoing
+           from (select d.*, coalesce(d.meta->>'incident_id', 'doc-' || d.id) as inc from documents d
+                 where d.kind = 'incident' and coalesce(d.meta->>'severity', '') <> 'ok') m
+           order by inc, updated_at desc
+         ) latest
+         order by updated_at desc limit $1",
+    )
+    .bind(limit)
+    .bind(ONGOING_MINUTES)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// 폴더에서 사라진 런북을 지운다. 남길 source 목록을 받는다.
 pub async fn prune_runbooks(pool: &PgPool, keep: &[String]) -> Result<u64> {
     let done = sqlx::query("delete from documents where kind = 'runbook' and not (source = any($1))")

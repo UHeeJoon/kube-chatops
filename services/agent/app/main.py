@@ -167,7 +167,9 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
                 suspicious = sorted(set(out.get("tainted") or []) | set(toolbox.suspicious))
                 # 사건 기록: 조사(보고서가 나온 것)만. 저장이 실패해도 보고는 그대로 돌려준다.
                 incident = None
-                if body.mode == "investigate" and (out.get("report") or body.alert):
+                # Slack 질문으로 시작해 "문제 없음" 으로 끝난 조사는 사건이 아니다 (과거를 묻는 질문이 사건 #22 로 기록돼 사건 목록에 섞였다, 11-28)
+                asked_and_fine = not body.alert and (out.get("report") or {}).get("status") == "ok"
+                if body.mode == "investigate" and (out.get("report") or body.alert) and not asked_and_fine:
                     try:
                         incident = await state.incidents.record(
                             thread_id=body.thread_id, question=body.question, alert=body.alert, report=out.get("report"),

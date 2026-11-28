@@ -285,6 +285,12 @@ struct LookupArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RecentArgs {
+    /// 돌려줄 사건 수 (1~10, 기본 5)
+    k: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DocumentArgs {
     /// search_runbooks 또는 similar_incidents 결과의 document_id
     document_id: i64,
@@ -331,6 +337,26 @@ impl RunbookServer {
             }
             Err(e) => {
                 SEARCHES.with_label_values(&["incident_lookup", "error"]).inc();
+                format!("도구 실행 실패: {e}")
+            }
+        }
+    }
+
+    #[tool(description = "기록된 사건을 가장 최근 것부터 시간순으로 돌려준다 (사건마다 최근 보고 하나, 시각은 KST). '가장 최근 장애가 뭐였나', '오늘 무슨 일이 있었나', '마지막 사건은 언제였나' 처럼 시간 순서를 묻는 질문에 쓴다. similar_incidents 는 글이 비슷한 것을 찾을 뿐 최신순이 아니므로 이런 질문에 쓰면 안 된다. 문제 없음으로 끝난 조사는 빠진다.")]
+    async fn recent_incidents(&self, Parameters(args): Parameters<RecentArgs>) -> String {
+        let k = args.k.unwrap_or(5);
+        if !(1..=MAX_K).contains(&k) {
+            return format!("입력 오류: k 는 1~{MAX_K}");
+        }
+        match db::recent(&self.app.pool, k).await {
+            Ok(rows) => {
+                SEARCHES.with_label_values(&["recent_incidents", if rows.is_empty() { "empty" } else { "hit" }]).inc();
+                let incidents: Vec<Value> = rows.iter().map(|r| compact_incident(r, "")).collect();
+                json!({ "count": incidents.len(), "incidents": incidents, "trust": "generated",
+                        "note": "기록된 사건, 최근 것부터 (at 은 그 사건의 마지막 보고 시각, KST). 자동으로 남긴 글이라 제목은 그때 조사의 결론입니다. tainted=true 면 값 대조에만 사용. 전문은 get_document(document_id)." }).to_string()
+            }
+            Err(e) => {
+                SEARCHES.with_label_values(&["recent_incidents", "error"]).inc();
                 format!("도구 실행 실패: {e}")
             }
         }
