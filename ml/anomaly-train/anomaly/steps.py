@@ -181,8 +181,6 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         mlflow.log_metric("rps_low", bundle["rps_low"])
         if bundle["rps_drop_ratio"] is not None:
             mlflow.log_metric("rps_drop_ratio", bundle["rps_drop_ratio"])
-        # 부분 급감 규칙이 켜졌는지 (데이터가 모자라거나 정상 비율이 불안정하면 꺼진다). 꺼져도 다른 지표에는 드러나지 않는다
-        mlflow.log_metric("rps_drop_ratio_enabled", int(final["rps_drop_ratio"] is not None))
         normal_all = usable(df)[lambda d: d["label"] == 0]
         cv = cv_false_alarms(normal_all, quantile, z_limit)
         mlflow.log_metrics(cv)
@@ -200,6 +198,8 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         # (AnomalyBaselineDrift) 새 기준은 전부 평가 쪽에만 들어가 재학습해도 고쳐지지 않았다 (11-28 검토).
         final = fit_bundle(normal_all, quantile, z_limit)
         mlflow.log_param("final_train_rows", len(normal_all))
+        # 부분 급감 규칙이 켜졌는지 (데이터가 모자라거나 정상 비율이 불안정하면 꺼진다). 꺼져도 다른 지표에는 드러나지 않는다
+        mlflow.log_metric("rps_drop_ratio_enabled", int(final["rps_drop_ratio"] is not None))
         mlflow.log_metrics({f"final_normal_mean_{f}": float(m) for f, m in zip(FEATURES, final["scaler"].mean_)})
         mlflow.set_tag("eval_model_id", _log_bundle(bundle, "model_eval", example))
         mlflow.set_tag("model_id", _log_bundle(final, "model", example))
