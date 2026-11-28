@@ -36,7 +36,7 @@ from . import graph as g  # noqa: E402
 from .budget import Ledger, Usage  # noqa: E402
 from .config import settings  # noqa: E402
 from .incidents import Incidents, repeat_answer, search_document, snapshot, to_markdown, tool_trace  # noqa: E402
-from .models import alert_name  # noqa: E402
+from .models import alert_name, thread_context  # noqa: E402
 from .safety import clean_text  # noqa: E402
 from .toolbox import Toolbox  # noqa: E402
 
@@ -63,6 +63,7 @@ class InvestigateIn(BaseModel):
 
 class RouteIn(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
+    thread_id: str | None = Field(default=None, max_length=200, description="있으면 그 스레드의 바로 앞 질문과 답을 함께 보고 분류한다")
 
 
 @asynccontextmanager
@@ -122,7 +123,14 @@ async def healthz() -> dict:
 async def route(body: RouteIn, request: Request) -> dict:
     usage = Usage()
     with DURATION.labels("route").time():
-        result = await g.route(body.text, request.app.state.ledger, usage)
+        thread = None
+        if body.thread_id:
+            try:  # 앞 대화를 읽지 못하면 메시지만으로 분류한다
+                snap = await request.app.state.graph.aget_state({"configurable": {"thread_id": body.thread_id}})
+                thread = thread_context(snap.values)
+            except Exception:  # noqa: BLE001
+                log.exception("스레드 기록 읽기 실패 thread=%s", body.thread_id)
+        result = await g.route(body.text, request.app.state.ledger, usage, thread)
     REQUESTS.labels("route", "200").inc()
     return {**result, "usage": _usage(usage)}
 

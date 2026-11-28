@@ -31,3 +31,20 @@ def test_a_thread_keeps_the_model_it_started_with():
     assert sticky("opus", "medium", True, picked, ("opus", "medium")) == ("opus", "medium", "thread")
     # 이 기능 이전에 시작된 스레드: 저장된 모델이 없지만 대화 기록이 있다 → 예전 설정
     assert sticky(None, None, True, picked, ("opus", "medium")) == ("opus", "medium", "thread")
+
+
+def test_thread_context_is_none_for_a_new_thread():
+    from app.models import thread_context
+
+    assert thread_context({}) is None
+    assert thread_context({"question": "x", "messages": []}) is None
+
+
+def test_thread_context_carries_the_last_question_and_answer():
+    from app.models import thread_context
+
+    got = thread_context({"messages": [{}], "question": "파드 뭐 있어?", "answer": "7개\n모두 Running", "report": None})
+    assert "앞의 요청: 파드 뭐 있어?" in got and "질문 답" in got and "7개 모두 Running" in got
+    got = thread_context({"messages": [{}], "question": "왜 느려?", "answer": None, "report": {"headline": "DB 지연"}})
+    assert "조사 보고" in got and "DB 지연" in got
+    assert len(thread_context({"messages": [{}], "question": "q", "answer": "가" * 5000}).split("\n")[1]) < 560

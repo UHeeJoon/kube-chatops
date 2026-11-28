@@ -225,7 +225,7 @@ intake = workflow(W, "WF-01 intake (Slack 이벤트)", [
     if_true(W, "MLOps?", (1100, 550), "={{ $json.mode === 'mlops' || $json.next === 'mlops' }}"),
     node(W, "MLOps (WF-04)", "n8n-nodes-base.executeWorkflow", 1.2, (1320, 650),
          {"workflowId": {"__rl": True, "value": WF["mlops"], "mode": "id"}, "options": {"waitForSubWorkflow": False}}),
-    http(W, "의도 분류", (660, 200), "POST", f"{AGENT}/route", "={{ JSON.stringify({ text: $json.text }) }}", "agent"),
+    http(W, "의도 분류", (660, 200), "POST", f"{AGENT}/route", "={{ JSON.stringify({ text: $json.text, thread_id: `slack-${$('준비').item.json.channel_id}-${$('준비').item.json.thread_id}` }) }}", "agent"),
     code(W, "다음 단계", (880, 200), DECIDE),
     if_true(W, "조사?", (1100, 200), "={{ $json.next === 'investigate' }}"),
     node(W, "조사 시작 (WF-02)", "n8n-nodes-base.executeWorkflow", 1.2, (1320, 100),

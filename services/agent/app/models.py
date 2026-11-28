@@ -40,3 +40,19 @@ def sticky(stored_model: str | None, stored_effort: str | None, has_history: boo
     if has_history:
         return (*legacy, "thread")
     return picked
+
+
+def thread_context(values: dict | None, limit: int = 500) -> str | None:
+    """스레드의 바로 앞 질문과 답을 분류기에 줄 짧은 글로. 기록이 없는 스레드(새 대화)면 None.
+
+    분류기는 메시지 한 줄만 봤다. 그래서 스레드 안의 "왜?", "그 전 거는?" 이 앞 대화 없이 분류돼
+    되묻는 말이 새 조사(보고서, 사건 기록)로 갔다 (11-29).
+    """
+    values = values or {}
+    if not values.get("messages"):
+        return None
+    report = values.get("report") or {}
+    last = values.get("answer") or (report.get("headline") if isinstance(report, dict) else None) or ""
+    kind = "조사 보고" if report else "질문 답"
+    clip = lambda t: " ".join(str(t or "").split())[:limit]  # noqa: E731
+    return f"앞의 요청: {clip(values.get('question'))}\n앞의 응답 ({kind}): {clip(last)}"

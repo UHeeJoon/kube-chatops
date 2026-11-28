@@ -287,12 +287,12 @@ def build(checkpointer) -> Any:
     return g.compile(checkpointer=checkpointer)
 
 
-async def route(text: str, ledger: Ledger, usage: Usage) -> dict[str, Any]:
+async def route(text: str, ledger: Ledger, usage: Usage, thread: str | None = None) -> dict[str, Any]:
     """Slack 메시지 의도 분류. 상태가 필요 없어 그래프 없이 한 번 호출한다."""
     ctx = Ctx(toolbox=None, ledger=ledger, usage=usage)  # type: ignore[arg-type]
     resp = await _llm(
         ctx, "route", model=settings.route_model, effort=settings.route_effort, system=ROUTE_SYSTEM,
-        messages=[{"role": "user", "content": f"<message>\n{text[:4000]}\n</message>"}],
+        messages=[{"role": "user", "content": (f"<thread>\n{thread}\n</thread>\n" if thread else "") + f"<message>\n{text[:4000]}\n</message>"}],
         output_config={"format": {"type": "json_schema", "schema": ROUTE_SCHEMA}},
     )
     if resp.stop_reason == "refusal":
