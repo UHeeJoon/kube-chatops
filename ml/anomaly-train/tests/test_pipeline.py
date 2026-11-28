@@ -16,9 +16,10 @@ from test_detector import synthetic
 
 @pytest.fixture
 def pipeline(tmp_path, monkeypatch):
+    # SQLite 저장소 (MLflow 3 은 파일 저장소를 받지 않는다). 학습 이미지는 mlflow-skinny 라 sqlalchemy·alembic 이 없으므로
+    # 시험 환경에만 따로 설치한다 (.github/workflows/test.yml)
     mlflow.set_tracking_uri(f"sqlite:///{tmp_path}/mlflow.db")
     mlflow.set_registry_uri(f"sqlite:///{tmp_path}/mlflow.db")
-    monkeypatch.setenv("MLFLOW_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
     frames: dict = {}
     monkeypatch.setattr(data, "put_frame", lambda df, key: frames.__setitem__(key, df.copy()) or key)
     monkeypatch.setattr(data, "get_frame", lambda key: frames[key].copy())
