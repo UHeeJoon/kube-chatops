@@ -35,7 +35,8 @@ from pydantic import BaseModel, Field  # noqa: E402
 from . import graph as g  # noqa: E402
 from .budget import Ledger, Usage  # noqa: E402
 from .config import settings  # noqa: E402
-from .incidents import Incidents, search_document, snapshot, to_markdown, tool_trace  # noqa: E402
+from .incidents import Incidents, repeat_answer, search_document, snapshot, to_markdown, tool_trace  # noqa: E402
+from .models import alert_name  # noqa: E402
 from .toolbox import Toolbox  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}')
@@ -48,7 +49,7 @@ for _api in ("route", "investigate"):  # 0 으로 미리 생성 (budget.py 주�
     DURATION.labels(_api)
     for _status in ("200", "401", "429", "500"):
         REQUESTS.labels(_api, _status)
-for _reason in ("done", "llm_calls", "tool_calls", "time", "cost", "refusal"):
+for _reason in ("done", "llm_calls", "tool_calls", "time", "cost", "refusal", "repeat"):
     STOPS.labels(_reason)
 
 
@@ -131,6 +132,23 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
     state = request.app.state
     # 같은 스레드의 조사는 한 번에 하나만. 조사 중인 스레드에 질문이 오면 진행 중 대화(도구 호출로 끝난 상태) 위에
     # 새 메시지가 붙어 API 가 거절하거나 대화가 섞인다. 뒤에 온 요청은 앞의 것이 끝난 뒤 그 결과를 이어받아 시작한다.
+    # 같은 알림이 같은 대상에 대해 금방 다시 오면 (해소됐다 다시 울림, 그룹에 같은 파드가 다시 들어옴) 새로 조사하지 않는다.
+    # 알림마다 유료 조사를 하면 되풀이되는 알림 하나가 하루 예산을 다 쓰고, 그 뒤의 진짜 알림은 "예산 소진" 만 받는다.
+    # Slack 에서 사람이 요청한 조사(alert 없음)는 막지 않는다.
+    if body.alert and body.mode == "investigate":
+        try:
+            prior = await state.incidents.recent_report(body.alert, settings.repeat_alert_minutes)
+        except Exception:  # noqa: BLE001 — 확인하지 못하면 평소대로 조사한다
+            log.exception("반복 알림 확인 실패 thread=%s", body.thread_id)
+            prior = None
+        if prior:
+            name = alert_name(body.alert)
+            STOPS.labels("repeat").inc()
+            REQUESTS.labels("investigate", "200").inc()
+            log.info("investigate thread=%s repeat of incident=%s alert=%s age=%ss", body.thread_id, prior["incident_id"], name, prior["age_seconds"])
+            return {"thread_id": body.thread_id, "mode": body.mode, "answer": repeat_answer(name, prior, settings.repeat_alert_minutes), "report": None,
+                    "stopped_by": "repeat", "tool_calls": 0, "usage": _usage(usage), "model": None, "effort": None,
+                    "incident": {"incident_id": prior["incident_id"], "report_no": None}, "injection_suspected": []}
     lock = state.thread_locks.get(body.thread_id)
     if lock is None:
         lock = state.thread_locks[body.thread_id] = asyncio.Lock()

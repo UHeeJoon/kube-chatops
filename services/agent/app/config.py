@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     daily_budget_usd: float = 5.0
     budget_timezone: str = "Asia/Seoul"
     max_concurrent: int = 2
+    repeat_alert_minutes: int = 20  # 같은 알림·같은 대상을 이 시간 안에 조사했으면 다시 조사하지 않고 앞의 결과를 알려 준다 (0 이면 끔)
     # 질문 모드(단순 조회): 짧은 답, 작은 상한. 모델과 effort 는 스레드의 첫 턴에 정해 끝까지 쓴다 (바꾸면 그 스레드의 대화 캐시가 깨진다)
     answer_max_llm_calls: int = 4
     answer_max_tool_calls: int = 5

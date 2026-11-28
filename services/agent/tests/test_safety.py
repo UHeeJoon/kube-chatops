@@ -140,3 +140,16 @@ def test_runbook_has_no_hidden_or_instruction_text(path):
     if path.name not in EXPLAINS_INJECTION:
         found = _INJECTION.search(text)
         assert not found, f"지시처럼 보이는 문장: {found.group(0)!r}"
+
+
+def test_repeat_alert_is_the_same_target_only_when_no_new_pod_appears():
+    from app.incidents import alert_pods, repeat_answer, same_target
+
+    def alert(*pods):
+        return {"alerts": [{"labels": {"alertname": "DemoPodRestarting", "pod": p}} for p in pods] or [{"labels": {"alertname": "DemoHighLatency"}}]}
+
+    assert same_target(alert_pods(alert("a")), alert_pods(alert("a", "b")))       # 같은 파드가 다시 옴
+    assert not same_target(alert_pods(alert("a", "c")), alert_pods(alert("a")))  # 새 파드가 합류: 다시 조사한다
+    assert same_target(alert_pods(alert()), alert_pods(alert()))                 # 파드 라벨이 없는 알림은 이름으로만 본다
+    text = repeat_answer("DemoHighLatency", {"incident_id": 7, "age_seconds": 290, "report": {"headline": "p95 2.2초"}}, 20)
+    assert "5분 전" in text and "사건 #7" in text and "p95 2.2초" in text

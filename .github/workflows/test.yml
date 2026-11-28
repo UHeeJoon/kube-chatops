@@ -83,6 +83,19 @@ jobs:
         working-directory: services/mcp-runbook
         run: cargo test --quiet
 
+  # n8n 워크플로: 생성 결과가 저장소의 JSON 과 같은지(코드만 고치고 다시 만들지 않은 경우를 잡는다),
+  # 승인·격리·오류 처리의 Code 노드가 가짜 입력에서 기대대로 판단하는지
+  n8n-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: 생성 결과가 저장소와 같은가
+        run: python n8n/build_workflows.py && git diff --exit-code -- n8n/workflows
+      - name: Code 노드 판단 시험
+        run: node n8n/test_workflows.js n8n/workflows
+
   agent:
     runs-on: ubuntu-latest
     steps:

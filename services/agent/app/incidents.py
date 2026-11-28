@@ -126,6 +126,23 @@ async def snapshot(toolbox: Toolbox, alert: dict[str, Any] | None) -> dict[str, 
     return out
 
 
+def alert_pods(alert: dict[str, Any] | None) -> set[str]:
+    return {str(a.get("labels", {}).get("pod")) for a in (alert or {}).get("alerts") or [] if a.get("labels", {}).get("pod")}
+
+
+def same_target(new: set[str], old: set[str]) -> bool:
+    """새 알림이 앞의 조사와 같은 대상인가. 새로 나타난 파드가 하나라도 있으면 다른 일로 본다 (다시 조사한다)."""
+    return new <= old
+
+
+def repeat_answer(alertname: str, prior: dict[str, Any], minutes: int) -> str:
+    report = prior.get("report") or {}
+    ago = max(1, round(prior["age_seconds"] / 60))
+    return (f"{ago}분 전에 같은 알림(`{alertname}`)을 같은 대상에 대해 조사했습니다 (사건 #{prior['incident_id']}).\n"
+            f"그때의 결론: {str(report.get('headline') or '')[:300]}\n"
+            f"{minutes}분 안에 다시 온 알림이라 새로 조사하지 않았습니다. 상황이 달라졌으면 이 스레드에서 봇을 불러 다시 조사를 요청하세요.")
+
+
 class Incidents:
     def __init__(self, pool: AsyncConnectionPool) -> None:
         self.pool = pool
@@ -180,6 +197,23 @@ class Incidents:
                 (cost_usd, incident_id))
             count = (await cur.fetchone())["report_count"]
         return {"incident_id": incident_id, "report_no": count}
+
+    async def recent_report(self, alert: dict[str, Any], minutes: int) -> dict[str, Any] | None:
+        """같은 알림을 같은 대상에 대해 최근에 조사한 보고가 있으면 돌려준다 (반복 조사 억제용)."""
+        labels = (alert.get("alerts") or [{}])[0].get("labels") or {}
+        alertname, namespace = labels.get("alertname"), labels.get("namespace") or "-"
+        if not alertname or minutes <= 0:
+            return None
+        async with self.pool.connection() as conn:
+            cur = await conn.execute(
+                "select r.incident_id, r.alert, r.report, extract(epoch from now() - r.at)::int as age_seconds "
+                "from incident_reports r join incidents i on i.id = r.incident_id "
+                "where r.alertname = %s and i.namespace = %s and r.report is not null and r.at > now() - make_interval(mins => %s) "
+                "order by r.at desc limit 5", (alertname, namespace, minutes))
+            for row in await cur.fetchall():
+                if same_target(alert_pods(alert), alert_pods(row["alert"])):
+                    return {"incident_id": row["incident_id"], "age_seconds": row["age_seconds"], "report": row["report"]}
+        return None
 
     async def list(self, limit: int) -> list[dict[str, Any]]:
         async with self.pool.connection() as conn:

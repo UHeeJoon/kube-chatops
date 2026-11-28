@@ -264,7 +264,7 @@ const more = firing.length > 1
   : '';
 const meta = `\\n_${a.labels?.namespace ?? ''} · ${a.labels?.severity ?? ''} · ${kst(a.startsAt)} 시작 · 이 스레드에 자동 조사 결과가 달립니다_`;
 // 선 조치: auto_action=quarantine 알림이면 가장 최근에 시작된 대상 파드 하나를 격리한다 (demo 만)
-const target = firing.filter(x => x.labels?.auto_action === 'quarantine' && x.labels?.pod && x.labels?.namespace === 'demo')
+const target = firing.filter(x => x.labels?.auto_action === 'quarantine' && /^[a-z0-9.-]{1,253}$/.test(String(x.labels?.pod ?? '')) && x.labels?.namespace === 'demo')
   .sort((x, y) => String(y.startsAt).localeCompare(String(x.startsAt)))[0];
 return [{ json: {
   quarantine: target ? { namespace: target.labels.namespace, pod: target.labels.pod, reason: name } : null,
@@ -338,7 +338,7 @@ const toSlack = t => String(t ?? '')
 const u0 = res.body?.usage ?? {};
 const cost = (u0.cost_usd ?? 0) + (req.route_cost ?? 0);  // 의도 분류 비용까지 합친 요청 하나의 비용
 const llm = (u0.llm_calls ?? 0) + (req.route_cost ? 1 : 0);
-const stopped = res.body?.stopped_by && res.body.stopped_by !== 'done' ? ` · 한도 도달로 중단(${res.body.stopped_by})` : '';
+const stopped = res.body?.stopped_by && !['done', 'repeat'].includes(res.body.stopped_by) ? ` · 한도 도달로 중단(${res.body.stopped_by})` : '';
 const foot = { type: 'context', elements: [{ type: 'mrkdwn',
   text: `도구 ${res.body?.tool_calls ?? 0}회 · LLM ${llm}회 · $${cost.toFixed(3)} · ${secs}초${stopped}` +
     (res.body?.incident ? ` · 사건 #${res.body.incident.incident_id} 의 ${res.body.incident.report_no}번째 보고 (\`@봇 사건 ${res.body.incident.incident_id}\` 로 전체 보기)` : '') }] };
@@ -842,6 +842,10 @@ if (req.op === 'scale') {
   const prev = $json;
   const pick = $('직전 커밋').item.json;
   if (!pick.prev_sha) return refuse('이 파일의 이전 커밋이 없어 되돌릴 수 없습니다.');
+  // 롤백은 "이 파일의 마지막 커밋 취소" 다. 보고서가 올라온 뒤에 파일이 또 바뀌었으면(증설 승인, 수정 커밋) 취소되는 것은
+  // 보고서가 문제로 본 변경이 아니라 그 뒤의 변경이다. 보고서가 본 상태와 다르면 실행하지 않는다.
+  const changedAt = Date.parse(pick.last_at ?? '') / 1000;
+  if (changedAt && changedAt > Number(req.message_ts)) return refuse(`이 보고서가 올라온 뒤에 배포 파일이 바뀌었습니다 ("${pick.last_title}"). 지금 롤백하면 보고서가 본 변경이 아니라 그 변경이 취소되므로 실행하지 않았습니다. 다시 조사한 뒤 새 보고서에서 승인하세요.`);
   // 마지막 변경이 이미 되돌리기면 또 되돌리지 않는다 (고장 난 상태로 돌아간다)
   if (/롤백|되돌|revert/i.test(pick.last_title)) return refuse(`마지막 변경이 이미 되돌리기입니다 ("${pick.last_title}"). 또 되돌리면 그 전 상태로 돌아가므로 실행하지 않았습니다.`);
   if (prev.statusCode !== 200) return refuse(`이전 버전 파일 읽기 실패 (${prev.statusCode}).`);
@@ -859,6 +863,7 @@ PREV_REF = r"""
 const req = $('요청 정리').item.json;
 const list = Array.isArray($json.body) ? $json.body : [];
 return [{ json: { ...req, prev_sha: list[1]?.sha ?? null, last_sha: String(list[0]?.sha ?? '').slice(0, 7),
+  last_at: list[0]?.commit?.committer?.date ?? null,
   last_title: String(list[0]?.commit?.message ?? '').split('\n')[0].slice(0, 80) } }];
 """
 GIT_DONE = r"""
@@ -957,13 +962,23 @@ const e = $json;
 return [{ json: { flow: e.workflow?.name ?? 'unknown', result: 'error', execution_id: e.execution?.id ?? null,
   failed_node: e.execution?.lastNodeExecuted ?? null, error: (e.execution?.error?.message ?? '').slice(0, 500) } }];
 """
+ERROR_NOTICE = r"""
+// 워크플로가 중간에 실패하면 사용자는 아무 답도 받지 못한다 ("조사하고 있습니다" 가 그대로 남거나 버튼을 눌러도 무응답).
+// 어느 스레드였는지는 여기서 알 수 없으므로 알림 채널에 한 줄 올린다. 오류 글은 줄이고 Slack 서식 문자를 뺀다.
+const e = $json;
+const msg = String(e.error ?? '').replace(/[<>`*_~|]/g, ' ').slice(0, 200);
+return [{ json: { text: `:x: 자동화 흐름 *${String(e.flow).replace(/[<>`*_~|]/g, ' ')}* 가 \`${String(e.failed_node ?? '?').replace(/[<>`*_~|]/g, ' ')}\` 단계에서 실패했습니다. 진행 중이던 조사나 버튼 처리가 끝나지 않았을 수 있습니다.\n_${msg} · 실행 ${e.execution_id ?? '?'}_` } }];
+"""
 audit = workflow(W, "WF-99 audit (감사 로그)", [
     node(W, "다른 흐름에서 호출", "n8n-nodes-base.executeWorkflowTrigger", 1.1, (0, 100), {"inputSource": "passthrough"}),
     node(W, "흐름 실패", "n8n-nodes-base.errorTrigger", 1, (0, 300), {}),
     code(W, "오류 정리", (220, 300), ON_ERROR),
     http(W, "감사 로그 보내기", (440, 200), "POST", f"{GATEWAY}/audit",
          "={{ JSON.stringify({ ...$json, at: new Date().toISOString() }) }}", "gateway", timeout_ms=10000),
-], links(("다른 흐름에서 호출", "감사 로그 보내기"), ("흐름 실패", "오류 정리"), ("오류 정리", "감사 로그 보내기")), error_wf=False)
+    code(W, "오류 알림 글", (440, 400), ERROR_NOTICE),
+    http(W, "오류 알림", (660, 400), "POST", f"{GATEWAY}/slack/post", "={{ JSON.stringify({ text: $json.text }) }}", "gateway", timeout_ms=10000),
+], links(("다른 흐름에서 호출", "감사 로그 보내기"), ("흐름 실패", "오류 정리"), ("오류 정리", "감사 로그 보내기"),
+         ("오류 정리", "오류 알림 글"), ("오류 알림 글", "오류 알림")), error_wf=False)
 
 
 if __name__ == "__main__":
