@@ -150,32 +150,64 @@ pub struct Related {
     pub source: String,
     pub meta: Value,
     pub recorded_at: String,
+    /// 이 사건에서 같은 값이 나온 보고 수 (사건 하나가 보고를 여러 번 남긴다)
+    pub reports: i64,
+    /// 최근 ONGOING_MINUTES 분 안에 보고가 있었다: 지금 조사하는 바로 그 사건일 수 있다
+    pub ongoing: bool,
 }
 
-/// 같은 개체가 나온 사건을 최근 것부터. 전체 건수도 함께 (재발 횟수).
-pub async fn lookup(pool: &PgPool, kind: &str, value: &str, limit: i64) -> Result<(i64, Option<String>, Vec<Related>)> {
-    let stats = sqlx::query(
-        "select count(*), to_char(min(d.updated_at) at time zone 'Asia/Seoul', 'YYYY-MM-DD HH24:MI')
-         from entities e join documents d on d.id = e.document_id where d.kind = 'incident' and e.kind = $1 and e.value = $2",
-    )
+/// 재발 횟수 요약. 사건 단위로 센다.
+#[derive(Debug)]
+pub struct LookupStats {
+    pub incidents: i64,
+    pub reports: i64,
+    pub ongoing: i64,
+    pub first: Option<String>,
+}
+
+/// 마지막 보고가 이 시간 안이면 "진행 중" 으로 본다 (에이전트의 사건 묶기 시간과 같은 정도)
+const ONGOING_MINUTES: i32 = 60;
+/// 같은 개체가 나온 보고들. 사건 번호가 없는 옛 문서는 문서 하나를 사건 하나로 본다.
+macro_rules! matched {
+    () => {
+        "select d.id, d.title, d.source, d.meta, d.updated_at, coalesce(d.meta->>'incident_id', 'doc-' || d.id) as inc
+     from entities e join documents d on d.id = e.document_id
+     where d.kind = 'incident' and e.kind = $1 and e.value = $2"
+    };
+}
+
+/// 같은 개체가 나온 사건을 최근 것부터, 사건마다 가장 최근 보고 하나씩. 재발 횟수도 함께.
+///
+/// 횟수는 보고가 아니라 사건으로 센다 (11-28 검토). 사건 하나는 알림이 다시 울릴 때마다 보고를 남기고, 보고마다 문서가 하나다.
+/// 문서 수로 세면 공격 한 번(WAF → 웹셸 → 격리)이 "3번 왔다" 가 되고, 방금 남긴 자기 보고가 "과거 사건" 으로 돌아온다.
+pub async fn lookup(pool: &PgPool, kind: &str, value: &str, limit: i64) -> Result<(LookupStats, Vec<Related>)> {
+    let stats = sqlx::query(concat!("with m as (", matched!(), ")
+         select count(distinct inc), count(*),
+                count(distinct inc) filter (where updated_at > now() - make_interval(mins => $3)),
+                to_char(min(updated_at) at time zone 'Asia/Seoul', 'YYYY-MM-DD HH24:MI')
+         from m"))
     .bind(kind)
     .bind(value)
+    .bind(ONGOING_MINUTES)
     .fetch_one(pool)
     .await?;
-    let (total, first): (i64, Option<String>) = (stats.get(0), stats.get(1));
-    let rows = sqlx::query_as::<_, Related>(
-        "select d.id as document_id, d.title, d.source, d.meta,
-                to_char(d.updated_at at time zone 'Asia/Seoul', 'YYYY-MM-DD HH24:MI') as recorded_at
-         from entities e join documents d on d.id = e.document_id
-         where d.kind = 'incident' and e.kind = $1 and e.value = $2
-         order by d.updated_at desc limit $3",
-    )
+    let stats = LookupStats { incidents: stats.get(0), reports: stats.get(1), ongoing: stats.get(2), first: stats.get(3) };
+    let rows = sqlx::query_as::<_, Related>(concat!("with m as (", matched!(), ")
+         select document_id, title, source, meta, recorded_at, reports, ongoing from (
+           select distinct on (inc) id as document_id, title, source, meta, updated_at,
+                  to_char(updated_at at time zone 'Asia/Seoul', 'YYYY-MM-DD HH24:MI') as recorded_at,
+                  count(*) over (partition by inc) as reports,
+                  max(updated_at) over (partition by inc) > now() - make_interval(mins => $4) as ongoing
+           from m order by inc, updated_at desc
+         ) latest
+         order by updated_at desc limit $3"))
     .bind(kind)
     .bind(value)
     .bind(limit)
+    .bind(ONGOING_MINUTES)
     .fetch_all(pool)
     .await?;
-    Ok((total, first, rows))
+    Ok((stats, rows))
 }
 
 /// 폴더에서 사라진 런북을 지운다. 남길 source 목록을 받는다.
@@ -219,16 +251,16 @@ pub async fn search(pool: &PgPool, kind: &str, query: &str, embedding: &[f32], l
     let tsquery = or_query(query);
     let hits = sqlx::query_as::<_, Hit>(
         "with vec as (
-           select c.id, row_number() over (order by c.embedding <=> $1::vector) as rank
+           select c.id, row_number() over (order by c.embedding <=> $1::vector, c.id) as rank
            from chunks c join documents d on d.id = c.document_id
            where d.kind = $2
            order by c.embedding <=> $1::vector
            limit $5
          ), txt as (
-           select c.id, row_number() over (order by ts_rank(c.tsv, q) desc) as rank
+           select c.id, row_number() over (order by ts_rank(c.tsv, q) desc, c.id) as rank
            from chunks c join documents d on d.id = c.document_id, to_tsquery('simple', nullif($3, '')) q
            where d.kind = $2 and c.tsv @@ q
-           order by ts_rank(c.tsv, q) desc
+           order by ts_rank(c.tsv, q) desc, c.id
            limit $5
          ), fused as (
            select coalesce(vec.id, txt.id) as id,
@@ -236,9 +268,10 @@ pub async fn search(pool: &PgPool, kind: &str, query: &str, embedding: &[f32], l
                   vec.rank as vector_rank, txt.rank as text_rank
            from vec full outer join txt on vec.id = txt.id
          ), best as (
-           -- 문서마다 가장 잘 맞은 구역 하나만 (같은 문서의 구역들이 결과를 다 차지하지 않게)
-           select f.*, row_number() over (partition by c.document_id order by f.score desc, f.id) as rn
-           from fused f join chunks c on c.id = f.id
+           -- 문서마다 가장 잘 맞은 구역 하나만 (같은 문서의 구역들이 결과를 다 차지하지 않게).
+           -- 사건은 사건 번호로 묶는다: 사건 하나가 보고(문서)를 여러 번 남기므로 문서로 묶으면 같은 사건의 보고들이 상위를 차지한다.
+           select f.*, row_number() over (partition by coalesce(d.meta->>'incident_id', 'doc-' || d.id) order by f.score desc, f.id) as rn
+           from fused f join chunks c on c.id = f.id join documents d on d.id = c.document_id
          )
          select d.id as document_id, d.title, d.source, c.heading, c.content, d.meta,
                 f.score::float8 as score, f.vector_rank, f.text_rank

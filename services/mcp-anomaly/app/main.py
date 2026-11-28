@@ -204,9 +204,11 @@ def _monitor_pods(prom_sync: httpx2.Client, model_sync: httpx2.Client, at: int) 
             resp.raise_for_status()
             found = pod_findings(rows, resp.json()["predictions"])
         M_POD_Z.clear()  # 사라진 파드의 값이 남지 않게
-        for f in (found or {}).get("anomalous", []):
+        # "이 파드만 이상" 을 뜻하는 지표다. 모든 파드가 이상이면 서비스 전체 문제이므로 내지 않는다 (합계 판정이 맡는다)
+        some = found["anomalous"] if found and len(found["anomalous"]) < found["checked"] else []
+        for f in some:
             M_POD_Z.labels(f["pod"], f["main_signal"]).set(f["z"])
-        M_ANOMALY.labels("pod").set(int(bool(found and found["anomalous"])))
+        M_ANOMALY.labels("pod").set(int(bool(some)))
     except Exception as e:  # noqa: BLE001 — 파드별 판정 실패가 서비스 판정을 막으면 안 된다
         # 실패하면 마지막 값을 지운다. 남겨 두면 "이 파드만 이상" 이 판정 없이 계속 울린다
         M_POD_Z.clear()
@@ -246,8 +248,11 @@ def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
         name: _parse_range(prom_sync.get("/api/v1/query_range", params=_range_params(q, start, end)).json())
         for name, q in FEATURE_QUERIES.items()
     }
-    if not series["rps"]:
-        raise RuntimeError("demo 요청 지표 없음")
+    # 요청 지표가 없으면(파드가 모두 사라짐, 수집 대상에서 빠짐) sum(rate()) 는 0 이 아니라 빈 결과를 낸다.
+    # 그대로 두면 마지막으로 값이 있던 분(최대 4분 전, 정상)을 "지금" 으로 판정하다가 그 뒤에는 "탐지 멈춤" 만 뜬다.
+    # 조회는 성공했는데 가장 최근 분의 값이 없으면 요청 0 으로 채점한다: 그것이 요청 급감이다.
+    if end not in series["rps"]:
+        series["rps"][end] = 0.0
     # 마지막 1분만이 아니라 앞의 몇 분도 함께 보낸다. 모델 v7 은 IsolationForest 단독 판정을
     # "바로 앞 1분도 이상일 때만" 인정해서, 한 줄만 보내면 그 판정이 확정되지 않는다 (다른 버전은 영향 없음). 판정은 마지막 줄 것을 쓴다.
     stamps = sorted(series["rps"])

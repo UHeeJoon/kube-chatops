@@ -12,7 +12,7 @@ ALERT = {"alerts": [{"labels": {"alertname": "DemoHighLatency"}, "annotations": 
 SEARCH = {"count": 1, "results": [{"document_id": 4, "section": "증상", "title": "응답 지연 급증 (demo-app)", "source": "runbooks/high-latency.md",
                                    "trust": "reviewed", "text": "- p95 가 오른다"}]}
 DOC = {"id": 4, "title": "응답 지연 급증 (demo-app)", "source": "runbooks/high-latency.md", "trust": "reviewed",
-       "content": "## 증상\n- p95 가 오른다\n## 확인\n- by (pod) 로 나눠 본다\n## 조치\n- 한 파드만 느리면 restart"}
+       "content": "관련 알림: `DemoHighLatency`.\n\n## 증상\n- p95 가 오른다\n## 확인\n- by (pod) 로 나눠 본다\n## 조치\n- 한 파드만 느리면 restart"}
 
 
 class FakeToolbox:
@@ -95,3 +95,15 @@ def test_checks_are_found_in_the_shape_the_search_server_returns():
     assert checks == [("prometheus__query_instant", {"query": "up"})]
     left = json.loads(body)["content"]
     assert "checks" not in left and "미리 실행" not in left and left.count("## 확인") == 1 and "## 원인 후보" in left
+
+
+def test_runbook_that_does_not_name_the_alert_is_attached_without_running_its_checks():
+    """검색은 맞는 런북이 없어도 가장 가까운 것을 준다. 이 알림을 적어 두지 않은 런북의 확인 조회는 실행하지 않는다."""
+    other = {**CHECKS_DOC, "content": CHECKS_DOC["content"].replace("DemoHighLatency", "DemoSomethingElse")}
+    tb = FakeToolbox(document=other, tools=TOOLS)
+    parts = run(tb)
+    assert len(parts) == 1 and parts[0].startswith("가장 비슷한 런북 (이 알림을 맡은 런북은 없음")
+    assert [c for c in tb.calls if not c.startswith("runbook__")] == []
+    # 사람이 검토한 런북이 아니면(사건 기록) 알림 이름이 있어도 실행하지 않는다
+    tb = FakeToolbox(document={**CHECKS_DOC, "trust": "generated", "source": "incident/3/report/1"}, tools=TOOLS)
+    assert len(run(tb)) == 1 and [c for c in tb.calls if not c.startswith("runbook__")] == []

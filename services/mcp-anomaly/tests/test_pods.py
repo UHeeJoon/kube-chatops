@@ -41,3 +41,12 @@ def test_traffic_drop_alone_is_not_a_pod_finding_and_single_pod_is_skipped():
     drop = {"is_anomaly": True, "traffic_drop": True, "zscore_anomaly": False, "iforest_anomaly": False, "top_feature": "rps", "top_z": 1.0}
     assert pod_findings(rows, [drop, OK])["anomalous"] == []
     assert pod_findings(rows[:1], [OK]) is None
+
+
+def test_unconfirmed_iforest_does_not_turn_a_traffic_drop_into_a_pod_finding():
+    """요청이 한쪽으로 쏠려 급감으로 보이는 파드: 확정 전 iforest 가 켜져 있어도 어느 특성도 2 이상 벗어나지 않았으면 건너뛴다."""
+    rows = pod_rows(SERIES)
+    weak = {"is_anomaly": True, "traffic_drop": True, "zscore_anomaly": False, "iforest_anomaly": True, "top_feature": "rps", "top_z": 1.3}
+    assert pod_findings(rows, [OK, weak])["anomalous"] == []
+    strong = {**weak, "top_feature": "error_ratio", "top_z": 2.6}
+    assert [b["pod"] for b in pod_findings(rows, [OK, strong])["anomalous"]] == ["b"]

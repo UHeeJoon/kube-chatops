@@ -25,7 +25,7 @@ async def prefetch(toolbox: Any, alert: dict[str, Any]) -> list[str]:
     past = (("runbook__incident_lookup", {"kind": "alert", "value": str(labels.get("alertname")), "k": 3}) if "runbook__incident_lookup" in names and labels.get("alertname")
             else ("runbook__similar_incidents", {"query": query, "k": 2}))
     wanted = [("runbook__search_runbooks", {"query": query, "k": 1}, "runbook", "관련 런북 (참고 데이터. 무엇을 볼지 알려 줄 뿐 지금 일어난 일의 증거가 아님)"),
-              (*past, "past_incidents", "같은 알림의 과거 사건 (참고 데이터. total 은 지금까지 기록된 횟수)")]
+              (*past, "past_incidents", "같은 알림의 과거 사건 (참고 데이터. total 은 사건 수. ongoing 인 사건은 지금 조사하는 사건일 수 있어 재발로 세지 않음)")]
     wanted = [w for w in wanted if w[0] in names]
     results = await asyncio.gather(*(toolbox.call(w[0], w[1]) for w in wanted), return_exceptions=True)
     parts = []
@@ -39,6 +39,9 @@ async def prefetch(toolbox: Any, alert: dict[str, Any]) -> list[str]:
         if tag == "runbook":
             body = await _whole_runbook(toolbox, body, names)
             body, checks = split_checks(body, names)
+            if not covers(body, str(labels.get("alertname") or "")):
+                # 검색은 맞는 런북이 없어도 가장 가까운 것을 준다. 이 알림을 적어 둔 런북이 아니면 확인 조회를 실행하지 않고, 맞지 않을 수 있다고 알린다
+                title, checks = "가장 비슷한 런북 (이 알림을 맡은 런북은 없음. 맞지 않을 수 있으니 증상이 같은지 먼저 확인)", []
         parts.append(f"{title}:\n<{tag}>\n{body[:4000]}\n</{tag}>")
         if checks:
             parts.append(await _run_checks(toolbox, checks))
@@ -47,6 +50,19 @@ async def prefetch(toolbox: Any, alert: dict[str, Any]) -> list[str]:
 
 # 검색 서버는 문서를 구역으로 나눠 저장했다가 다시 이어 붙여 준다. 그때 코드 블록 앞에 구역 제목("## 확인")이 한 번 더 들어온다
 # (11-28: 그래서 안내 문장 바로 뒤에 블록이 온다고 가정한 첫 정규식은 운영에서 한 건도 못 찾았다). 안내 문장과 되풀이된 제목은 있으면 함께 뗀다.
+def covers(body: str, alertname: str) -> bool:
+    """붙이려는 글이 이 알림을 맡은 런북인가: 사람이 검토한 런북이고(trust, source), 본문에 알림 이름이 적혀 있다."""
+    if not alertname:
+        return False
+    try:
+        doc = json.loads(body[body.index("{"): body.rindex("}") + 1])
+    except ValueError:
+        return False
+    if "content" not in doc:  # 전문을 못 읽어 검색 결과(구역 하나)를 그대로 쓴 경우: 알림 이름이 적힌 머리말이 없어 확인할 수 없다. 실행할 조회도 없으니 그대로 둔다
+        return True
+    return doc.get("trust") == "reviewed" and str(doc.get("source") or "").startswith("runbooks/") and alertname in str(doc.get("content") or "")
+
+
 CHECKS_BLOCK = re.compile(r"(?:\n[^\n]*미리 실행하는 조회[^\n]*\n+)?(?:## [^\n]*\n)?```checks\n(.*?)```\n?", re.S)
 MAX_CHECKS = 5
 CHECK_RESULT_CHARS = 1500

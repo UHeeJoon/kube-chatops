@@ -345,3 +345,23 @@ def test_models_before_the_ratio_rule_ignore_the_new_column():
     cyc = cyclic(drop_at=(1300, 1320))
     old = {k: v for k, v in steps.fit_bundle(cyc.iloc[:1000], 0.999, 4.0).items() if k != "rps_drop_ratio"}
     assert not score_frame(old, cyc.reindex(columns=RAW_COLUMNS))["traffic_drop"].any()
+
+
+def test_model_fit_on_all_normal_data_learns_a_recent_baseline_shift():
+    """평소 기준이 최근에 바뀌면(배포로 메모리 수준 상승) 앞쪽 70% 로만 학습한 모델은 옛 기준 그대로다.
+
+    서빙하는 모델은 정상 구간 전체로 다시 학습하므로 새 기준을 안다 (재학습이 기준 이동을 고치려면 이래야 한다).
+    """
+    df = synthetic()
+    normal = df[df["label"] == 0].sort_values("ts")
+    recent = normal["ts"] >= normal["ts"].iloc[int(len(normal) * 0.8)]
+    df.loc[normal.index[recent.to_numpy()], "mem_ratio"] += 0.2
+    train, _ = steps.split(df, 0.7)
+    old = steps.fit_bundle(train, 0.999, 4.0)
+    new = steps.fit_bundle(steps.usable(df)[lambda d: d["label"] == 0], 0.999, 4.0)
+    i = list(old["features"]).index("mem_ratio")
+    row = df.loc[normal.index[recent.to_numpy()]].tail(5).reindex(columns=RAW_COLUMNS)
+    z_old = abs(score_frame(old, row)["z_mem_ratio"]).max()
+    z_new = abs(score_frame(new, row)["z_mem_ratio"]).max()
+    assert new["scaler"].mean_[i] > old["scaler"].mean_[i] + 0.02
+    assert z_old >= 4 and z_new < z_old / 2

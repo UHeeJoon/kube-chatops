@@ -34,6 +34,9 @@ POD_QUERIES = {
 MAX_PODS = 20
 
 
+IFOREST_MIN_Z = 2.0  # 모델의 iforest_min_z 와 같은 값
+
+
 def pod_rows(series: dict[str, dict[str, float | None]]) -> list[tuple[str, dict]]:
     """질의 결과({특성: {파드: 값}})를 모델에 넣을 행으로. 요청을 받고 있는 파드만 본다 (격리됐거나 막 뜬 파드는 뺀다)."""
     pods = sorted(p for p, v in series.get("rps", {}).items() if v is not None and v > 0)[:MAX_PODS]
@@ -51,7 +54,10 @@ def pod_findings(rows: list[tuple[str, dict]], preds: list[dict]) -> dict | None
     bad = []
     for (pod, row), p in zip(rows, preds):
         # 요청 급감은 파드별로 보지 않는다 (파드 수를 곱한 값이라 분산이 고르지 않으면 가짜 급감이 된다)
-        if not p.get("is_anomaly") or (p.get("traffic_drop") and not p.get("zscore_anomaly") and not p.get("iforest_anomaly")):
+        # iforest_anomaly 는 확정 전 값이다 (모델은 어느 특성이든 |z| >= 2 일 때만 인정한다). 요청이 적을 때 가장 자주 켜지므로
+        # 그대로 믿으면 "급감이라 건너뛴다" 는 조건이 바로 그 경우에 뚫린다. 같은 확인을 여기서도 한다.
+        iforest = bool(p.get("iforest_anomaly")) and abs(p.get("top_z") or 0) >= IFOREST_MIN_Z
+        if not p.get("is_anomaly") or (p.get("traffic_drop") and not p.get("zscore_anomaly") and not iforest):
             continue
         signal = p["top_feature"]
         raw_key = "p95_seconds" if signal == "p95_log_ms" else signal

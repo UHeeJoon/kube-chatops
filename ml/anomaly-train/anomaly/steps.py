@@ -40,6 +40,7 @@ DROP_RATIO_QUANTILE = 0.001
 DROP_RATIO_FACTOR = 0.8
 DROP_RATIO_MIN_STABLE = 0.6
 DROP_RATIO_MIN_ROWS = 300
+FINAL_RECALL_TOLERANCE = 0.05  # 서빙할 모델(정상 구간 전체로 학습)의 장애 탐지율이 평가용 모델보다 이만큼 넘게 낮으면 통과시키지 않는다
 IFOREST_MIN_Z = 2.0  # IsolationForest 판정은 어느 특성이든 |z| 가 이 값 이상일 때만 인정 (z 한계 4 의 절반)
 CV_BLOCKS = 5
 
@@ -187,24 +188,32 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         sc = bundle["scaler"]
         mlflow.log_metrics({f"normal_mean_{f}": float(m) for f, m in zip(FEATURES, sc.mean_)})
         mlflow.log_metrics({f"normal_scale_{f}": float(v) for f, v in zip(FEATURES, sc.scale_)})
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "detector.joblib"
-            joblib.dump(bundle, path)
-            # 입력 예시가 모델의 입력 스키마가 된다 (서빙이 이 열들을 요청에서 읽는다). 빈 값이 없는 행을 쓴다
-            example = train_df.reindex(columns=RAW_COLUMNS).astype("float64").fillna(train_df.reindex(columns=RAW_COLUMNS).astype("float64").median()).fillna(0.0).head(3).reset_index(drop=True)
-            info = mlflow.pyfunc.log_model(
-                name="model",
-                python_model=MODEL_CODE,
-                artifacts={"detector": str(path)},
-                input_example=example,
-                pip_requirements=_pip_requirements(),
-            )
-        mlflow.set_tag("model_id", info.model_id)
+        # 입력 예시가 모델의 입력 스키마가 된다 (서빙이 이 열들을 요청에서 읽는다). 빈 값이 없는 행을 쓴다
+        example = train_df.reindex(columns=RAW_COLUMNS).astype("float64").fillna(train_df.reindex(columns=RAW_COLUMNS).astype("float64").median()).fillna(0.0).head(3).reset_index(drop=True)
+        # 모델을 둘 남긴다.
+        #   model_eval: 정상 구간 앞쪽 70% 로 학습. 평가(뒤쪽 30% + 장애 구간)는 이 모델로 한다 (본 적 없는 데이터로 재야 하므로).
+        #   model     : 정상 구간 전체로 같은 방법으로 다시 학습. 등록·서빙하는 것은 이 모델이다.
+        # 앞쪽 70% 모델을 그대로 서빙하면 가장 최근 30% 를 모르는 모델이 나간다. 평소 기준이 최근에 바뀌어 재학습한 경우
+        # (AnomalyBaselineDrift) 새 기준은 전부 평가 쪽에만 들어가 재학습해도 고쳐지지 않았다 (11-28 검토).
+        final = fit_bundle(normal_all, quantile, z_limit)
+        mlflow.log_param("final_train_rows", len(normal_all))
+        mlflow.log_metrics({f"final_normal_mean_{f}": float(m) for f, m in zip(FEATURES, final["scaler"].mean_)})
+        mlflow.set_tag("eval_model_id", _log_bundle(bundle, "model_eval", example))
+        mlflow.set_tag("model_id", _log_bundle(final, "model", example))
         mlflow.set_tag("test_set", f"s3://{data.bucket()}/{test_key}")
         run_id = run.info.run_id
     emit("run_id", run_id)
     emit("test_set", test_key)
     return run_id
+
+
+def _log_bundle(bundle: dict, name: str, example: pd.DataFrame) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "detector.joblib"
+        joblib.dump(bundle, path)
+        info = mlflow.pyfunc.log_model(name=name, python_model=MODEL_CODE, artifacts={"detector": str(path)},
+                                       input_example=example, pip_requirements=_pip_requirements())
+    return info.model_id
 
 
 def _pip_requirements() -> list[str]:
@@ -319,12 +328,15 @@ def replay(new_bundle: dict, champion_bundle: dict) -> dict:
 
 def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     client = MlflowClient()
-    model_id = client.get_run(run_id).data.tags["model_id"]
+    tags = client.get_run(run_id).data.tags
+    model_id = tags["model_id"]  # 서빙할 모델 (정상 구간 전체로 학습)
+    eval_id = tags.get("eval_model_id") or model_id  # 평가용 (앞쪽 70%). 예전 run 에는 없다
     test = data.get_frame(test_key)
     y = test["label"]
 
     minute = minute_numbers(test)
-    new_bundle = _bundle_of(f"models:/{model_id}")
+    new_bundle = _bundle_of(f"models:/{eval_id}")
+    final_bundle = _bundle_of(f"models:/{model_id}") if eval_id != model_id else new_bundle
     scored = score_frame(new_bundle, test.reindex(columns=RAW_COLUMNS), minute)
     model_m = _metrics(y, scored["is_anomaly"])
     base_m = _metrics(y, scored["zscore_anomaly"])  # 기준선: 특성별 z-score 만
@@ -359,15 +371,19 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     shadow: dict = {}
     if champion_bundle is not None:
         try:
-            shadow = replay(new_bundle, champion_bundle)
+            shadow = replay(final_bundle, champion_bundle)  # 실제로 서빙할 모델로 비교한다
         except Exception as e:  # noqa: BLE001 — 비교는 참고 자료다. 실패해도 평가 결과는 낸다
             print(f"최근 {REPLAY_HOURS}시간 재채점 실패: {type(e).__name__}: {e}")
 
     # 통과 조건: 최소 F1, 기준선보다 크게 나쁘지 않음(0.02 이내), champion 보다 나빠지지 않음(0.01 이내),
     # 같은 평가 데이터에서 champion 보다 오탐이 늘지 않음 (1분까지는 표본 흔들림으로 봄).
     # 오탐이 늘어난 모델은 F1 이 좋아도 올리지 않는다 (11-27 결정: v6 는 F1 0.917 인데 오탐 때문에 승격 보류).
+    # 서빙할 모델(정상 구간 전체로 다시 학습)은 평가 데이터의 정상 구간을 이미 봤으므로 오탐은 여기서 잴 수 없다.
+    # 대신 장애를 놓치지 않는지만 본다: 최근 데이터를 더 넣어 기준이 넓어지면 장애 탐지율이 떨어질 수 있다.
+    final_recall = _metrics(y, score_frame(final_bundle, test.reindex(columns=RAW_COLUMNS), minute)["is_anomaly"])["recall"]
     passed = (
-        model_m["f1"] >= min_f1
+        final_recall >= model_m["recall"] - FINAL_RECALL_TOLERANCE
+        and model_m["f1"] >= min_f1
         and model_m["f1"] >= base_m["f1"] - 0.02
         and (champion_f1 is None or model_m["f1"] >= champion_f1 - 0.01)
         and (champion_fa is None or fa["false_alarm_minutes"] <= champion_fa + 1)
@@ -377,6 +393,7 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
         "baseline_zscore": base_m,
         "iforest_only": iforest_m,
         "champion_f1": champion_f1,
+        "final_recall": final_recall,
         **fa,
         "champion_false_alarm_minutes": champion_fa,
         **by_kind,
@@ -388,6 +405,7 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
         mlflow.log_metrics({f"test_{k}": v for k, v in model_m.items()})
         mlflow.log_metrics({f"baseline_{k}": v for k, v in base_m.items()})
         mlflow.log_metrics({f"iforest_{k}": v for k, v in iforest_m.items()})
+        mlflow.log_metric("final_recall", final_recall)
         mlflow.log_metrics({**fa, **by_kind, **shadow, **{k: v for k, v in eps.items() if not isinstance(v, str)}})
         if champion_fa is not None:
             mlflow.log_metric("champion_false_alarm_minutes", champion_fa)

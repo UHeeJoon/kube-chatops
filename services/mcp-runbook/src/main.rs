@@ -45,8 +45,10 @@ use embed::Embedder;
 const MAX_K: i64 = 10;
 /// 도구 결과에서 청크 본문을 자르는 길이. 전문은 get_document 로 본다.
 const SNIPPET_CHARS: usize = 700;
-/// 알림의 주인 런북을 찾을 때 넉넉히 가져오는 개수
-const OWNER_SEARCH_K: i64 = 8;
+/// 색인 방식의 판. 청크 나누기·임베딩 글·모델을 바꾸면 올린다
+const INDEX_VERSION: &str = "v2";
+/// 알림의 주인 런북을 찾을 때 넉넉히 가져오는 개수. 런북 전체보다 커야 주인이 빠지지 않는다 (런북 19개)
+const OWNER_SEARCH_K: i64 = 50;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 static SEARCHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -131,7 +133,9 @@ impl App {
         if !matches!(kind, "runbook" | "incident") {
             bail!("kind 는 runbook 또는 incident 여야 한다");
         }
-        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        // 내용만이 아니라 색인 방식도 해시에 넣는다. 청크 크기, 임베딩에 붙이는 글, 모델을 바꾸면 INDEX_VERSION 을 올려 전부 다시 색인한다
+        // (본문만 보면 방식을 바꿔도 글이 그대로인 문서는 옛 청크와 벡터로 남는다).
+        let hash = format!("{:x}", Sha256::digest(format!("{INDEX_VERSION}\n{content}").as_bytes()));
         if db::unchanged(&self.pool, source, &hash).await? {
             return Ok("unchanged");
         }
@@ -157,26 +161,32 @@ impl App {
             .filter(|p| p.extension().is_some_and(|x| x == "md"))
             .collect();
         entries.sort();
+        // 먼저 전부 읽어 알림 → 런북 표부터 만든다. 임베딩이 끝나기를 기다리면 그동안의 알림 조사가 표 없이 순위에만 기댄다.
         for path in entries {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            match std::fs::read_to_string(&path) {
+                Ok(content) => files.push((name, content)),
+                Err(e) => tracing::error!(file = name, error = %e, "런북 읽기 실패"),
+            }
+        }
+        let named: Vec<(String, String)> = files.iter().map(|(name, content)| (format!("runbooks/{name}"), content.clone())).collect();
+        let owners = alert_owners(&named);
+        tracing::info!(alerts = owners.len(), "알림 → 런북 표");
+        if let Ok(mut guard) = self.owners.write() {
+            *guard = owners;
+        }
+        for (name, content) in &files {
             let source = format!("runbooks/{name}");
-            let content = std::fs::read_to_string(&path).with_context(|| format!("읽기 실패: {}", path.display()))?;
-            let result = match self.ingest("runbook", &source, None, &content, &json!({ "file": name })).await {
+            let result = match self.ingest("runbook", &source, None, content, &json!({ "file": name })).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(source, error = %e, "런북 수집 실패");
                     "error"
                 }
             };
-            files.push((source.clone(), content));
             INGESTED.with_label_values(&["runbook", result]).inc();
             tracing::info!(source, result, "런북 수집");
             keep.push(source);
-        }
-        let owners = alert_owners(&files);
-        tracing::info!(alerts = owners.len(), "알림 → 런북 표");
-        if let Ok(mut guard) = self.owners.write() {
-            *guard = owners;
         }
         let removed = db::prune_runbooks(&self.pool, &keep).await?;
         tracing::info!(runbooks = keep.len(), removed, "런북 폴더 수집 완료");
@@ -302,7 +312,7 @@ impl RunbookServer {
         self.app.search_json("similar_incidents", "incident", &args.query, args.k).await
     }
 
-    #[tool(description = "값이 정확히 같은 개체가 나온 과거 사건을 최근 것부터 찾는다. '이 출발 IP 가 전에도 왔나', '이 알림이 얼마나 자주 울렸나', '이 파드가 전에도 격리됐나' 처럼 재발 여부를 볼 때 쓴다. total 은 전체 건수. 비슷한 글을 찾는 similar_incidents 와 달리 값이 일치하는 것만 나온다.")]
+    #[tool(description = "값이 정확히 같은 개체가 나온 과거 사건을 최근 것부터 찾는다. '이 출발 IP 가 전에도 왔나', '이 알림이 얼마나 자주 울렸나', '이 파드가 전에도 격리됐나' 처럼 재발 여부를 볼 때 쓴다. total 은 사건 수 (사건 하나가 보고를 여러 번 남겨도 1), ongoing 은 그 가운데 최근 1시간 안에 보고가 있던 사건 수. 비슷한 글을 찾는 similar_incidents 와 달리 값이 일치하는 것만 나온다.")]
     async fn incident_lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let (kind, value, k) = (args.kind.trim(), args.value.trim(), args.k.unwrap_or(5));
         if !db::ENTITY_KINDS.contains(&kind) {
@@ -312,12 +322,12 @@ impl RunbookServer {
             return format!("입력 오류: value 는 영문·숫자와 . : - _ / 만 (120자 이하), k 는 1~{MAX_K}");
         }
         match db::lookup(&self.app.pool, kind, value, k).await {
-            Ok((total, first, rows)) => {
+            Ok((stats, rows)) => {
                 SEARCHES.with_label_values(&["incident_lookup", if rows.is_empty() { "empty" } else { "hit" }]).inc();
                 let incidents: Vec<Value> = rows.iter().map(|r| compact_incident(r, kind)).collect();
-                json!({ "kind": kind, "value": value, "total": total, "first_recorded": first, "incidents": incidents,
-                        "trust": "generated",
-                        "note": "값이 같은 사건, 최근 것부터 (자동으로 남긴 글. tainted=true 면 값 대조에만 사용). 같은 값이라도 원인이 같다는 뜻은 아닙니다. 전문은 get_document(document_id)." }).to_string()
+                json!({ "kind": kind, "value": value, "total": stats.incidents, "reports": stats.reports, "ongoing": stats.ongoing,
+                        "first_recorded": stats.first, "incidents": incidents, "trust": "generated",
+                        "note": "값이 같은 사건, 최근 것부터, 사건마다 가장 최근 보고 하나 (자동으로 남긴 글. tainted=true 면 값 대조에만 사용). total 은 사건 수, reports 는 보고 수. ongoing=true 인 사건은 최근 1시간 안에 보고가 있던 것으로 지금 조사하는 사건일 수 있으니 재발로 세지 않습니다. 같은 값이라도 원인이 같다는 뜻은 아닙니다. 전문은 get_document(document_id)." }).to_string()
             }
             Err(e) => {
                 SEARCHES.with_label_values(&["incident_lookup", "error"]).inc();
@@ -350,6 +360,12 @@ fn compact_incident(row: &db::Related, queried: &str) -> Value {
     });
     if row.meta.get("tainted").and_then(Value::as_bool).unwrap_or(false) {
         out["tainted"] = json!(true);
+    }
+    if row.reports > 1 {
+        out["reports"] = json!(row.reports);
+    }
+    if row.ongoing {
+        out["ongoing"] = json!(true);
     }
     if let Some(entities) = row.meta.get("entities").and_then(Value::as_object) {
         let others: serde_json::Map<String, Value> = entities.iter().filter(|(k, _)| k.as_str() != queried).map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -538,14 +554,19 @@ mod tests {
             document_id: 40, title: "사건 #8: SQLi 차단".into(), source: "incident/8/report/5".into(), recorded_at: "2026-11-27 23:40".into(),
             meta: json!({"incident_id": 8, "alertname": "DemoWafAttackBlocked", "namespace": "demo", "tainted": true,
                          "entities": {"alert": ["DemoWafAttackBlocked"], "ip": ["198.51.100.89"]}}),
+            reports: 3, ongoing: true,
         };
         let v = compact_incident(&row, "alert");
         assert_eq!(v["incident_id"], 8);
         assert_eq!(v["tainted"], true);
         assert_eq!(v["with"], json!({"ip": ["198.51.100.89"]}));
         assert!(v.get("alertname").is_none() && v.get("source").is_none());
-        let clean = db::Related { meta: json!({"incident_id": 9}), ..row };
-        assert!(compact_incident(&clean, "alert").get("tainted").is_none());
+        // 사건 하나의 보고 수와 진행 중 표시 (재발로 세지 않게)
+        assert_eq!(compact_incident(&row, "ip")["reports"], 3);
+        assert_eq!(compact_incident(&row, "ip")["ongoing"], true);
+        let clean = db::Related { meta: json!({"incident_id": 9}), reports: 1, ongoing: false, ..row };
+        let v = compact_incident(&clean, "alert");
+        assert!(v.get("tainted").is_none() && v.get("reports").is_none() && v.get("ongoing").is_none());
     }
 
     #[test]
