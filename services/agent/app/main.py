@@ -14,6 +14,7 @@ import asyncio
 import hmac
 import logging
 import time
+import weakref
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -78,6 +79,7 @@ async def lifespan(app: FastAPI):
     app.state.pool, app.state.ledger, app.state.incidents = pool, ledger, incidents
     app.state.graph = g.build(saver)
     app.state.sem = asyncio.Semaphore(settings.max_concurrent)
+    app.state.thread_locks = weakref.WeakValueDictionary()  # thread_id → Lock. 쓰는 요청이 없으면 사라진다
     start_http_server(settings.metrics_port)
     log.info("agent ready")
     yield
@@ -127,15 +129,23 @@ async def route(body: RouteIn, request: Request) -> dict:
 async def investigate(body: InvestigateIn, request: Request) -> dict:
     usage = Usage()
     state = request.app.state
-    async with state.sem:
+    # 같은 스레드의 조사는 한 번에 하나만. 조사 중인 스레드에 질문이 오면 진행 중 대화(도구 호출로 끝난 상태) 위에
+    # 새 메시지가 붙어 API 가 거절하거나 대화가 섞인다. 뒤에 온 요청은 앞의 것이 끝난 뒤 그 결과를 이어받아 시작한다.
+    lock = state.thread_locks.get(body.thread_id)
+    if lock is None:
+        lock = state.thread_locks[body.thread_id] = asyncio.Lock()
+    async with lock, state.sem:
+        # 기다리는 동안 다른 요청이 예산을 다 썼을 수 있다. 실행 직전에 다시 본다 (들어올 때의 검사는 대기열 앞에서 한 것)
+        await check_budget(request)
         with DURATION.labels("investigate").time():
             async with Toolbox() as toolbox:
                 ctx = g.Ctx(toolbox=toolbox, ledger=state.ledger, usage=usage)
                 # 실행마다 상한 카운터와 결과를 초기화한다 (messages 는 체크포인트에서 이어 붙는다)
-                inp = {"question": body.question, "mode": body.mode, "answer": None, "alert": body.alert, "started": time.time(), "llm_calls": 0, "tool_calls": 0, "cost_usd": 0.0, "stopped_by": None, "report": None}
+                inp = {"question": body.question, "mode": body.mode, "answer": None, "alert": body.alert, "started": time.time(), "llm_calls": 0, "tool_calls": 0, "cost_usd": 0.0, "stopped_by": None, "report": None, "finishing": False}
                 out = await state.graph.ainvoke(inp, config={"configurable": {"thread_id": body.thread_id}, "recursion_limit": 60}, context=ctx)
                 stopped = out.get("stopped_by") or "done"
-                suspicious = sorted(set(toolbox.suspicious))
+                # 이번 요청만이 아니라 이 스레드가 지금까지 읽은 것 전부 (대화에 남아 있으므로)
+                suspicious = sorted(set(out.get("tainted") or []) | set(toolbox.suspicious))
                 # 사건 기록: 조사(보고서가 나온 것)만. 저장이 실패해도 보고는 그대로 돌려준다.
                 incident = None
                 if body.mode == "investigate" and (out.get("report") or body.alert):

@@ -208,7 +208,34 @@ def _monitor_pods(prom_sync: httpx2.Client, model_sync: httpx2.Client, at: int) 
             M_POD_Z.labels(f["pod"], f["main_signal"]).set(f["z"])
         M_ANOMALY.labels("pod").set(int(bool(found and found["anomalous"])))
     except Exception as e:  # noqa: BLE001 — 파드별 판정 실패가 서비스 판정을 막으면 안 된다
+        # 실패하면 마지막 값을 지운다. 남겨 두면 "이 파드만 이상" 이 판정 없이 계속 울린다
+        M_POD_Z.clear()
+        _forget(M_ANOMALY, "pod")
+        M_RUNS.labels("pod_error").inc()
         log.warning("pod monitor failed: %s: %s", type(e).__name__, e)
+
+
+def _forget(gauge: Gauge, *labels: str) -> None:
+    try:
+        gauge.remove(*labels)
+    except KeyError:
+        pass
+
+
+# 판정이 이만큼 연속으로 실패하면 마지막 판정값을 지운다. 한 번의 실패(일시적 조회 오류)로 지우면 알림의 for 가 초기화된다.
+STALE_AFTER_FAILURES = 3
+
+
+def clear_verdict() -> None:
+    """마지막 판정을 지운다. 판정이 멈췄는데 값이 1 로 남아 있으면 그 값을 보는 알림이 근거 없이 계속 울린다.
+
+    지운 뒤에는 "탐지가 멈췄다" 는 알림(AnomalyMonitorStale)만 남는다: 그것이 지금 아는 전부다.
+    """
+    M_ANOMALY.clear()
+    M_Z.clear()
+    M_POD_Z.clear()
+    M_SCORE.set(float("nan"))
+    M_RPS_RATIO.set(float("nan"))
 
 
 def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
@@ -250,13 +277,18 @@ def monitor_once(prom_sync: httpx2.Client, model_sync: httpx2.Client) -> dict:
 def _monitor_loop() -> None:
     prom_sync = httpx2.Client(base_url=PROM_URL, timeout=20.0)
     model_sync = httpx2.Client(timeout=20.0)
+    failures = 0
     while True:
         try:
             monitor_once(prom_sync, model_sync)
             M_RUNS.labels("ok").inc()
             M_LAST.set(time.time())
+            failures = 0
         except Exception as e:  # noqa: BLE001 — 모니터 실패가 MCP 도구를 멈추면 안 된다
             M_RUNS.labels("error").inc()
+            failures += 1
+            if failures == STALE_AFTER_FAILURES:
+                clear_verdict()
             log.warning("monitor failed: %s: %s", type(e).__name__, e)
         time.sleep(MONITOR_INTERVAL)
 

@@ -339,16 +339,23 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     # 지금 champion 이 있으면 같은 평가 데이터로 비교한다 (나빠지는 모델은 올리지 않는다)
     champion_f1 = None
     champion_fa = None
+    # "champion 이 아직 없다" 와 "champion 을 확인하지 못했다" 를 구분한다. 뒤의 것(MLflow 장애, 아티팩트 내려받기 실패)을
+    # 첫 모델로 처리하면 지금 모델과 비교하지 않고 최소 기준만으로 통과한다. 그런 경우는 이 단계를 실패시킨다.
     try:
         champ = client.get_model_version_by_alias(MODEL_NAME, "champion")
+    except mlflow.exceptions.MlflowException as e:
+        if e.error_code not in ("RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"):
+            raise
+        champ = None
+    if champ is None:
+        print("champion 없음 (첫 모델)")
+        champion_bundle = None
+    else:
         champion_bundle = _bundle_of(f"models:/{MODEL_NAME}@champion")
         champ_scored = score_frame(champion_bundle, test.reindex(columns=RAW_COLUMNS), minute)
         champion_f1 = _metrics(y, champ_scored["is_anomaly"])["f1"]
         champion_fa = false_alarms(y, champ_scored["is_anomaly"], minute)["false_alarm_minutes"]
         print(f"champion v{champ.version} f1={champion_f1} false_alarm_minutes={champion_fa}")
-    except mlflow.exceptions.MlflowException:
-        print("champion 없음 (첫 모델)")
-        champion_bundle = None
     shadow: dict = {}
     if champion_bundle is not None:
         try:

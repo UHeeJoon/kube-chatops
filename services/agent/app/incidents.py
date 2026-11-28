@@ -247,7 +247,7 @@ def search_document(incident_id: int, report_no: int, alertname: str | None, nam
     kernel = timeline.get("kernel_events")
     pods = [p.get("pod") for p in (kernel.get("by_pod") or kernel.get("pods") or [])] if isinstance(kernel, dict) else []
     rules = sorted({r for ip in (blocked.get("by_ip") or blocked.get("ips") or []) for r in (ip.get("rules") or {})}) if isinstance(blocked, dict) else []
-    entities = {"alert": [alertname] if alertname else [], "ip": [str(x) for x in ips[:20] if x], "rule": [str(r) for r in rules[:20]],
+    entities = {"alert": [alertname] if alertname else [], "ip": [str(x) for x in ips[:20] if x], "rule": sorted({str(r).split(":")[0].strip() for r in rules})[:20],  # "942100: SQL Injection ..." → 번호만 (받는 쪽은 공백이 든 값을 버린다)
                 "pod": [str(p) for p in pods[:20] if p] + ([str(pod)] if pod else [])}
     return {"kind": "incident", "source": f"incident/{incident_id}/report/{report_no}", "title": f"사건 #{incident_id}: {headline}",
             "content": "\n".join(lines),

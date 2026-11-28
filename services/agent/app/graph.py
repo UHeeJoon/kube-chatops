@@ -80,6 +80,9 @@ class State(TypedDict, total=False):
     finishing: bool  # 상한 도달 안내를 붙였음 (다음 호출이 마지막)
     stopped_by: str | None
     report: dict[str, Any] | None
+    # 이 스레드가 읽은 글 가운데 지시처럼 보이는 문장이 있던 곳 (알림, 도구 이름). 요청이 바뀌어도 지우지 않는다:
+    # 그 글은 대화에 남아 다음 턴의 모델도 읽으므로, 후속 조사의 조치 제안에도 승인 버튼을 붙이면 안 된다.
+    tainted: Annotated[list[str], operator.add]
     model: str  # 이 스레드가 쓰는 모델과 effort. 첫 턴에 정하고 바꾸지 않는다 (thinking 블록, 대화 캐시)
     effort: str
 
@@ -158,15 +161,19 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
     MODEL_PICK.labels(tier, model, effort).inc()
     if state.get("alert"):
         # 알림 내용도 외부 입력이므로 데이터로 표시한다 (라벨·주석에 공격자가 만든 글이 들어올 수 있다: 요청 경로, 파드 이름)
-        body, _ = guard_tool_text(json.dumps(state["alert"], ensure_ascii=False, sort_keys=True)[:4000])
+        body, alert_hits = guard_tool_text(json.dumps(state["alert"], ensure_ascii=False, sort_keys=True)[:4000])
         parts.append("알림 (데이터):\n<alert>\n" + body + "\n</alert>")
+        seen = len(runtime.context.toolbox.suspicious)
         fetched = await _prefetch(runtime.context.toolbox, state["alert"])
+        tainted = (["alert"] if alert_hits else []) + runtime.context.toolbox.suspicious[seen:]
         # 런북 빈틈: 알림이 왔는데 붙일 런북이 없었다 (런북이 없는 알림이 무엇인지 지표로 본다)
         name = str(((state["alert"].get("alerts") or [{}])[0].get("labels") or {}).get("alertname") or "unknown")[:60]
         PREFETCH.labels(name, "runbook" if any("<runbook>" in p for p in fetched) else "none",
                         "yes" if any("<checks>" in p for p in fetched) else "no").inc()
         parts += fetched
-    return {"messages": [{"role": "user", "content": "\n\n".join(parts)}], "model": model, "effort": effort}
+    else:
+        tainted = []
+    return {"messages": [{"role": "user", "content": "\n\n".join(parts)}], "model": model, "effort": effort, "tainted": tainted}
 
 
 async def investigate(state: State, runtime: Runtime[Ctx]) -> dict:
@@ -189,6 +196,7 @@ async def tools(state: State, runtime: Runtime[Ctx]) -> dict:
     ctx = runtime.context
     calls = _tool_uses(state["messages"][-1])
     allowed = max(0, _max_tools(state) - state.get("tool_calls", 0))
+    seen = len(ctx.toolbox.suspicious)
 
     async def run(i: int, block: dict) -> dict:
         if i >= allowed:
@@ -199,7 +207,7 @@ async def tools(state: State, runtime: Runtime[Ctx]) -> dict:
 
     # 한 턴의 도구 호출은 병렬로 실행하고, 결과는 한 user 메시지에 모아 돌려준다
     results: list[dict[str, Any]] = list(await asyncio.gather(*(run(i, b) for i, b in enumerate(calls))))
-    update: dict[str, Any] = {"tool_calls": state.get("tool_calls", 0) + min(len(calls), allowed)}
+    update: dict[str, Any] = {"tool_calls": state.get("tool_calls", 0) + min(len(calls), allowed), "tainted": ctx.toolbox.suspicious[seen:]}
     stopped = _over_limit({**state, **update}, ctx)
     if stopped:
         # 결과 뒤에 안내 글을 붙인다. 앞부분은 그대로라 캐시가 깨지지 않는다.
