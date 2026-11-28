@@ -37,6 +37,7 @@ from .budget import Ledger, Usage  # noqa: E402
 from .config import settings  # noqa: E402
 from .incidents import Incidents, repeat_answer, search_document, snapshot, to_markdown, tool_trace  # noqa: E402
 from .models import alert_name  # noqa: E402
+from .safety import clean_text  # noqa: E402
 from .toolbox import Toolbox  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}')
@@ -173,7 +174,7 @@ async def investigate(body: InvestigateIn, request: Request) -> dict:
                             trace=tool_trace(out.get("messages") or [], out.get("tool_calls", 0) + 1),
                             timeline=(timeline := await snapshot(toolbox, body.alert)), stopped_by=stopped,
                             tool_calls=out.get("tool_calls", 0), cost_usd=usage.cost_usd)
-                        await _index_incident(incident, body, out.get("report"), timeline, suspicious=len(toolbox.suspicious))
+                        await _index_incident(incident, body, out.get("report"), timeline, suspicious=len(suspicious))
                     except Exception:  # noqa: BLE001
                         log.exception("사건 기록 실패 thread=%s", body.thread_id)
     STOPS.labels(stopped).inc()
@@ -190,7 +191,7 @@ async def _index_incident(incident: dict[str, Any], body: InvestigateIn, report:
         return
     labels = ((body.alert or {}).get("alerts") or [{}])[0].get("labels") or {}
     doc = search_document(incident["incident_id"], incident["report_no"], labels.get("alertname"), labels.get("namespace") or "-", report, body.question, timeline,
-                          pod=labels.get("pod"), suspicious=suspicious)
+                          pod=labels.get("pod"), suspicious=suspicious, security=labels.get("category") == "security")
     try:
         async with httpx2.AsyncClient(timeout=20) as client:
             r = await client.post(settings.runbook_ingest_url, json=doc, headers={"Authorization": f"Bearer {token.get_secret_value()}"})
@@ -209,7 +210,8 @@ async def incidents_get(incident_id: int, request: Request) -> dict:
     inc = await request.app.state.incidents.get(incident_id)
     if inc is None:
         raise HTTPException(404, f"사건 #{incident_id} 이 없습니다")
-    return {"incident": inc, "markdown": to_markdown(inc)}
+    # Slack 으로 나가는 글이다. 사건 기록에는 요청 주소 같은 공격자가 만든 글이 원문으로 들어 있으므로 조사 보고와 같은 정리를 거친다
+    return {"incident": inc, "markdown": clean_text(to_markdown(inc))}
 
 
 @app.exception_handler(Exception)

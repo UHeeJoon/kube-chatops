@@ -50,3 +50,19 @@ def test_unconfirmed_iforest_does_not_turn_a_traffic_drop_into_a_pod_finding():
     assert pod_findings(rows, [OK, weak])["anomalous"] == []
     strong = {**weak, "top_feature": "error_ratio", "top_z": 2.6}
     assert [b["pod"] for b in pod_findings(rows, [OK, strong])["anomalous"]] == ["b"]
+
+
+def test_pod_queries_follow_the_service_queries():
+    """파드별 질의는 서비스 합계 질의를 손으로 옮긴 것이다. 한쪽만 고치면 같은 모델에 다른 눈금의 값이 들어간다."""
+    import re
+
+    from app.features import FEATURE_QUERIES, PATH_FILTER
+
+    assert set(POD_QUERIES) == set(FEATURE_QUERIES) - {"rps_prev_cycle"}
+    windows = lambda q: sorted(re.findall(r"\[(\d+[smh])\]", q))  # noqa: E731
+    for name, pod_q in POD_QUERIES.items():
+        svc_q = FEATURE_QUERIES[name]
+        assert windows(pod_q) == windows(svc_q), name                      # rate·deriv 창이 같다
+        assert (PATH_FILTER in pod_q) == (PATH_FILTER in svc_q), name       # 같은 경로를 뺀다
+        assert ("> 300" in pod_q) == ("> 300" in svc_q), name               # 재시작 직후 5분 제외
+        assert "by (pod" in pod_q or "by (le, pod" in pod_q, name

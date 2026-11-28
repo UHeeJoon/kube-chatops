@@ -56,8 +56,15 @@ class Usage:
     by_model: dict[str, float] = field(default_factory=dict)
 
 
+def price_of(model: str) -> tuple[float, float, float]:
+    """모델 이름의 값. 날짜가 붙은 이름("claude-opus-5-5-20260101")은 앞부분이 같은 모델의 값을 쓴다 (표에 없다고 가장 비싼 값으로 세면 약 2.5배로 잡힌다)."""
+    if model in PRICES:
+        return PRICES[model]
+    return next((v for k, v in PRICES.items() if model.startswith(k + "-")), FALLBACK_PRICE)
+
+
 def cost_of(model: str, stage: str, usage) -> tuple[float, int, int]:
-    p_in, p_out, read_mult = PRICES.get(model, FALLBACK_PRICE)
+    p_in, p_out, read_mult = price_of(model)
     cache_write = usage.cache_creation_input_tokens or 0
     cache_read = usage.cache_read_input_tokens or 0
     fresh = usage.input_tokens or 0

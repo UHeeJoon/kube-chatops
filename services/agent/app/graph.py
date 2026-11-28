@@ -155,6 +155,10 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
     now = datetime.now(ZoneInfo(settings.budget_timezone)).strftime("%Y-%m-%d %H:%M %Z")
     kind = "질문 (짧게 답하기)" if _is_answer(state) else "조사 (원인을 찾아 submit_report 로 보고)"
     parts = [f"요청 종류: {kind}", f"현재 시각: {now}", f"질문: {state['question']}"]
+    # 앞의 실행이 도구 호출 도중에 끊겼으면(파드 재시작, 시간 초과) 대화가 결과 없는 tool_use 로 끝나 있다. 그 위에 새 메시지를 붙이면
+    # API 가 거절해 이 스레드는 다시 쓸 수 없게 된다. 실행되지 않았다는 결과를 채워 대화를 이어 갈 수 있게 한다.
+    dangling = _tool_uses(state["messages"][-1]) if state.get("messages") and state["messages"][-1].get("role") == "assistant" else []
+    repair = [{"type": "tool_result", "tool_use_id": b["id"], "content": "실행되지 않았습니다 (앞의 조사가 중간에 끊겼습니다).", "is_error": True} for b in dangling]
     picked = _choose(state.get("mode") or "investigate", state.get("alert"), heavy=(settings.model, settings.investigate_effort),
                      light=(settings.light_model, settings.light_effort), answer=(settings.answer_model, settings.answer_effort), light_alerts=LIGHT_ALERTS)
     model, effort, tier = _sticky(state.get("model"), state.get("effort"), bool(state.get("messages")), picked, (settings.model, settings.investigate_effort))
@@ -173,7 +177,8 @@ async def intake(state: State, runtime: Runtime[Ctx]) -> dict:
         parts += fetched
     else:
         tainted = []
-    return {"messages": [{"role": "user", "content": "\n\n".join(parts)}], "model": model, "effort": effort, "tainted": tainted}
+    text = "\n\n".join(parts)
+    return {"messages": [{"role": "user", "content": repair + [{"type": "text", "text": text}] if repair else text}], "model": model, "effort": effort, "tainted": tainted}
 
 
 async def investigate(state: State, runtime: Runtime[Ctx]) -> dict:

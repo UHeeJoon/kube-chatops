@@ -40,6 +40,7 @@ DROP_RATIO_QUANTILE = 0.001
 DROP_RATIO_FACTOR = 0.8
 DROP_RATIO_MIN_STABLE = 0.6
 DROP_RATIO_MIN_ROWS = 300
+MIN_EVAL_ANOMALY_MINUTES = 20  # 평가 데이터에 장애 구간이 이보다 적으면 F1 을 믿을 수 없어 통과시키지 않는다
 FINAL_RECALL_TOLERANCE = 0.05  # 서빙할 모델(정상 구간 전체로 학습)의 장애 탐지율이 평가용 모델보다 이만큼 넘게 낮으면 통과시키지 않는다
 IFOREST_MIN_Z = 2.0  # IsolationForest 판정은 어느 특성이든 |z| 가 이 값 이상일 때만 인정 (z 한계 4 의 절반)
 CV_BLOCKS = 5
@@ -180,6 +181,8 @@ def train(dataset_key: str, prefix: str, train_frac: float, quantile: float, z_l
         mlflow.log_metric("rps_low", bundle["rps_low"])
         if bundle["rps_drop_ratio"] is not None:
             mlflow.log_metric("rps_drop_ratio", bundle["rps_drop_ratio"])
+        # 부분 급감 규칙이 켜졌는지 (데이터가 모자라거나 정상 비율이 불안정하면 꺼진다). 꺼져도 다른 지표에는 드러나지 않는다
+        mlflow.log_metric("rps_drop_ratio_enabled", int(final["rps_drop_ratio"] is not None))
         normal_all = usable(df)[lambda d: d["label"] == 0]
         cv = cv_false_alarms(normal_all, quantile, z_limit)
         mlflow.log_metrics(cv)
@@ -381,8 +384,17 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
     # 서빙할 모델(정상 구간 전체로 다시 학습)은 평가 데이터의 정상 구간을 이미 봤으므로 오탐은 여기서 잴 수 없다.
     # 대신 장애를 놓치지 않는지만 본다: 최근 데이터를 더 넣어 기준이 넓어지면 장애 탐지율이 떨어질 수 있다.
     final_recall = _metrics(y, score_frame(final_bundle, test.reindex(columns=RAW_COLUMNS), minute)["is_anomaly"])["recall"]
+    # 지금 모델에 있던 규칙이 새 모델에서 조용히 사라지면 안 된다 (부분 급감 규칙은 학습 데이터에 따라 꺼질 수 있다)
+    lost_rules = [k for k in ("rps_drop_ratio",) if champion_bundle is not None and champion_bundle.get(k) is not None and final_bundle.get(k) is None]
+    if lost_rules:
+        print(f"지금 모델에 있던 규칙이 새 모델에 없다: {lost_rules}")
+    # 평가할 장애가 없으면 F1 은 0 이라 어차피 떨어지지만, 이유가 "모델이 나쁘다" 가 아니라 "잴 것이 없다" 임을 남긴다
+    if int(y.sum()) < MIN_EVAL_ANOMALY_MINUTES:
+        print(f"평가 데이터의 장애 구간이 {int(y.sum())}분뿐이다 (최소 {MIN_EVAL_ANOMALY_MINUTES}분). 장애 주입 기록이 있는 기간을 포함해 다시 학습해야 한다")
     passed = (
-        final_recall >= model_m["recall"] - FINAL_RECALL_TOLERANCE
+        not lost_rules
+        and int(y.sum()) >= MIN_EVAL_ANOMALY_MINUTES
+        and final_recall >= model_m["recall"] - FINAL_RECALL_TOLERANCE
         and model_m["f1"] >= min_f1
         and model_m["f1"] >= base_m["f1"] - 0.02
         and (champion_f1 is None or model_m["f1"] >= champion_f1 - 0.01)
@@ -394,6 +406,8 @@ def evaluate(run_id: str, test_key: str, min_f1: float) -> bool:
         "iforest_only": iforest_m,
         "champion_f1": champion_f1,
         "final_recall": final_recall,
+        "lost_rules": lost_rules,
+        "eval_anomaly_minutes": int(y.sum()),
         **fa,
         "champion_false_alarm_minutes": champion_fa,
         **by_kind,
@@ -434,7 +448,9 @@ def register(run_id: str) -> str:
     client = MlflowClient()
     run = client.get_run(run_id)
     model_id = run.data.tags["model_id"]
-    mv = mlflow.register_model(f"models:/{model_id}", MODEL_NAME)
+    # 이 단계가 재시도되면(노드 오류) 같은 모델이 두 번 등록된다. 이미 등록된 버전이 있으면 그것을 쓴다
+    existing = [v for v in client.search_model_versions(f"name = '{MODEL_NAME}' and run_id = '{run_id}'")]
+    mv = existing[0] if existing else mlflow.register_model(f"models:/{model_id}", MODEL_NAME)
     uri = storage_uri(model_id)
     client.set_model_version_tag(MODEL_NAME, mv.version, "storage_uri", uri)
     client.set_model_version_tag(MODEL_NAME, mv.version, "test_f1", run.data.metrics.get("test_f1", ""))
@@ -540,5 +556,8 @@ def notify(status: str, failures: str = "") -> None:
     try:
         r = httpx.post(url, json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=15)
         print(f"n8n 응답 {r.status_code}")
+        if r.status_code >= 400:
+            # 학습 결과는 바꾸지 않지만(0 으로 끝낸다) 결과 카드가 Slack 에 가지 않았다는 것은 눈에 띄어야 한다
+            print(f"경고: 결과 알림이 전달되지 않았습니다 (n8n {r.status_code}: {r.text[:200]}). Slack 에 결과 카드가 없습니다")
     except httpx.HTTPError as e:
         print(f"n8n 알림 실패: {e}")

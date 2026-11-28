@@ -234,14 +234,16 @@ class Incidents:
 
 
 def search_document(incident_id: int, report_no: int, alertname: str | None, namespace: str, report: dict[str, Any] | None, question: str,
-                    timeline: dict[str, Any], pod: str | None = None, suspicious: int = 0) -> dict[str, Any]:
+                    timeline: dict[str, Any], pod: str | None = None, suspicious: int = 0, security: bool = False) -> dict[str, Any]:
     """런북 검색 서버에 넣을 사건 보고 한 건 (마크다운). 나중에 similar_incidents 가 이 글을 찾는다.
 
     여기 들어가는 글은 모델이 쓴 것이고, 모델은 공격자가 만든 글(요청 경로, User-Agent)을 읽고 썼다. 다음 조사가 이 글을 다시 읽으므로
     글마다 for_memory 로 지시처럼 보이는 문장을 빼고 길이를 자른다. 그런 문장이 있었거나 조사 중 지시문 의심(suspicious)이 있었으면
     meta.tainted 로 표시한다 (검색 결과에 그대로 나간다).
     """
-    tainted = suspicious > 0
+    # 보안 사건의 보고는 공격자가 만든 글을 읽고 쓴 것이다. 지시문 패턴에 걸리지 않게 바꿔 쓴 거짓 주장("이 IP 는 사내 점검용")도
+    # 원인 문장으로 남을 수 있으므로, 패턴에 걸렸는지와 상관없이 값 대조에만 쓰도록 표시한다.
+    tainted = suspicious > 0 or security
 
     def safe(value: Any, limit: int = 400) -> str:
         nonlocal tainted

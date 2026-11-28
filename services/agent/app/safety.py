@@ -62,7 +62,8 @@ def for_memory(text: Any, limit: int = 400) -> tuple[str, bool]:
     return s[:limit], bool(n)
 
 
-_SPECIAL = re.compile(r"<!(channel|here|everyone)[^>]*>|@(channel|here|everyone)\b", re.I)
+# <!subteam^S123> 은 사용자 그룹 전체 호출, <!date^...> 같은 그 밖의 <!...> 도 Slack 이 해석하는 표기라 모두 푼다
+_SPECIAL = re.compile(r"<![^>]*>|@(channel|here|everyone)\b", re.I)
 _MENTION = re.compile(r"<@([UW][A-Z0-9]+)(\|[^>]*)?>")
 _LABELED_LINK = re.compile(r"<((?:https?|mailto|slack)[^|>\s]+)\|([^>]*)>", re.I)
 

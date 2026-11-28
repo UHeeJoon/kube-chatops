@@ -472,7 +472,11 @@ async fn serve() -> Result<()> {
         .username(&env("PGUSER")?)
         .password(&env("PGPASSWORD")?)
         .database(&env_or("PGDATABASE", "rag"));
-    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(5).connect_with(options).await.context("DB 연결 실패")?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        // DB 가 죽었을 때 검색마다 기본 30초씩 기다리지 않게 한다 (알림 조사의 선조회가 그만큼 멈춘다). 5초 안에 못 얻으면 오류로 답한다
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with(options).await.context("DB 연결 실패")?;
     db::migrate(&pool).await?;
     let threads = env_or("EMBED_THREADS", "2").parse().context("EMBED_THREADS")?;
     let embedder = Embedder::load(model_dir(), threads)?;

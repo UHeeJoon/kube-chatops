@@ -254,13 +254,15 @@ const g = $json.body ?? {};
 const firing = (g.alerts ?? []).filter(a => a.status === 'firing');
 if (!firing.length) return [];
 const a = firing[0];
-const name = a.labels?.alertname ?? 'alert';
-const summary = a.annotations?.summary ?? '';
+// 알림의 라벨·주석에는 공격자가 만든 글이 들어올 수 있다 (요청 경로, 파드 이름). Slack 이 해석하는 표기(<!channel>, <@U..>, <주소|글자>)를 뺀다
+const plain = v => String(v ?? '').replace(/<[^>]*>/g, ' ').slice(0, 300);
+const name = plain(a.labels?.alertname ?? 'alert');
+const summary = plain(a.annotations?.summary);
 const kst = t => new Date(t).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hour12: false });
 // 알림이 하나면 한 줄, 여러 개면 대상별 목록
 const head = `:rotating_light: *${name}* · ${summary}`;
 const more = firing.length > 1
-  ? '\\n' + firing.slice(0, 5).map(x => `• ${x.labels?.pod ?? x.labels?.service ?? x.labels?.namespace ?? ''} ${x.annotations?.summary ?? ''}`.trim()).join('\\n')
+  ? '\\n' + firing.slice(0, 5).map(x => `• ${plain(x.labels?.pod ?? x.labels?.service ?? x.labels?.namespace)} ${plain(x.annotations?.summary)}`.trim()).join('\\n')
   : '';
 const meta = `\\n_${a.labels?.namespace ?? ''} · ${a.labels?.severity ?? ''} · ${kst(a.startsAt)} 시작 · 이 스레드에 자동 조사 결과가 달립니다_`;
 // 선 조치: auto_action=quarantine 알림이면 가장 최근에 시작된 대상 파드 하나를 격리한다 (demo 만)
@@ -278,7 +280,12 @@ QUARANTINE_PLAN = """
 // 격리 계획: 파드의 라벨을 전부 떼고(→ Deployment·Service 에서 빠지고 새 파드가 대신 뜸) 격리 라벨을 붙인다.
 // 떼어 낸 라벨은 어노테이션에 남겨 어느 앱이었는지 알 수 있게 한다. 파드는 지우지 않는다 (증거 보존).
 const q = $('알림 정리').item.json.quarantine;
-const res = $json;
+const res = $('파드 조회').item.json;
+// 상한: 이미 격리된 파드가 많으면 더 격리하지 않는다. 격리하면 새 파드가 대신 뜨므로, 새 파드마다 걸리는 오탐이면 격리가 끝없이 쌓인다.
+// 목록 조회가 실패하면 상한 없이 진행한다 (격리 자체가 안전 조치라 막는 쪽보다 하는 쪽이 낫다).
+const MAX_QUARANTINED = 3;
+const held = $json.statusCode === 200 ? ($json.body?.items ?? []).length : 0;
+if (held >= MAX_QUARANTINED) return [{ json: { ...q, do: false, note: `격리된 파드가 이미 ${held}개라 자동 격리를 멈춤 (상한 ${MAX_QUARANTINED}). 같은 탐지가 새 파드마다 반복되는지 사람이 확인 필요` } }];
 if (res.statusCode === 404) return [{ json: { ...q, do: false, note: '파드가 이미 없음' } }];
 if (res.statusCode !== 200) return [{ json: { ...q, do: false, note: `파드 조회 실패 (${res.statusCode})` } }];
 const labels = res.body.metadata?.labels ?? {};
@@ -382,7 +389,11 @@ if (res.statusCode === 200 && res.body?.answer && !res.body?.report) {  // 질�
   const btns = [];
   // 조사한 데이터에 지시처럼 보이는 문장이 있었으면 승인 버튼을 붙이지 않는다. 조치 제안 자체가 그 문장의 결과일 수 있으므로
   // 버튼 하나로 실행되게 두지 않고, 사람이 원본을 확인한 뒤 직접 하게 한다 (제안 내용은 보고서에 그대로 보인다).
-  for (const a of (sus.length ? [] : acts)) {
+  // 보안 알림의 조사는 공격자가 만든 글(요청 경로, User-Agent, 페이로드)을 읽고 낸 결론이다. 지시문 탐지는 패턴이라 피할 수 있으므로
+  // (닮은 글자, 뜻만 같은 바꿔 말하기) 보안 조사의 조치 제안은 버튼 하나로 실행되게 두지 않는다. 격리 파드 삭제 버튼은 고정 조치라 그대로 둔다.
+  const security = (req.alert?.alerts ?? []).some(x => x.labels?.category === 'security');
+  if (security && acts.length) foot.elements.push({ type: 'mrkdwn', text: '보안 알림의 조사라 조치 제안에 승인 버튼을 붙이지 않았습니다. 원본 로그를 확인한 뒤 필요하면 직접 실행하세요.' });
+  for (const a of ((sus.length || security) ? [] : acts)) {
     const m = /(?:^|\/)(demo-app)$/.exec(String(a.target ?? '').trim());
     if (a.type === 'retrain' && !btns.some(b => b.action_id === 'mlops_retrain')) {
       btns.push({ type: 'button', action_id: 'mlops_retrain', value: 'anomaly-train', text: { type: 'plain_text', text: '재학습 시작' } });
@@ -430,6 +441,8 @@ investigate = workflow(W, "WF-02 investigate (조사와 보고)", [
     if_true(W, "격리 대상?", (220, 600), "={{ !!$json.quarantine }}"),
     http(W, "파드 조회", (440, 700), "GET",
          f"={{{{ '{K8S}/api/v1/namespaces/' + $json.quarantine.namespace + '/pods/' + $json.quarantine.pod }}}}", None, "k8s_actions"),
+    http(W, "격리 수 조회", (550, 800), "GET",
+         f"{K8S}/api/v1/namespaces/demo/pods?labelSelector={QUARANTINE_LABEL}%3Dtrue&limit=50", None, "k8s_actions"),
     code(W, "격리 계획", (660, 700), QUARANTINE_PLAN),
     if_true(W, "격리 필요?", (880, 700), "={{ $json.do }}"),
     http(W, "격리", (1100, 650), "PATCH",
@@ -455,7 +468,7 @@ investigate = workflow(W, "WF-02 investigate (조사와 보고)", [
     ("WF-01 에서 호출", "조사 요청"),
     ("Alertmanager", "알림 정리"), ("알림 정리", "격리 대상?"),
     ("격리 대상?", "파드 조회", 0), ("격리 대상?", "알림 글 올리기", 1),
-    ("파드 조회", "격리 계획"), ("격리 계획", "격리 필요?"), ("격리 필요?", "격리", 0), ("격리 필요?", "격리 반영", 1),
+    ("파드 조회", "격리 수 조회"), ("격리 수 조회", "격리 계획"), ("격리 계획", "격리 필요?"), ("격리 필요?", "격리", 0), ("격리 필요?", "격리 반영", 1),
     ("격리", "격리 반영"), ("격리 반영", "알림 글 올리기"),
     ("알림 글 올리기", "알림 스레드"), ("알림 스레드", "조사 요청"),
     ("조사 요청", "조사 중 표시"), ("조사 중 표시", "조사"), ("조사", "보고서 만들기"), ("보고서 만들기", "결과 올리기"),

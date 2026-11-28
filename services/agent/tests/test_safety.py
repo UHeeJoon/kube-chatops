@@ -153,3 +153,29 @@ def test_repeat_alert_is_the_same_target_only_when_no_new_pod_appears():
     assert same_target(alert_pods(alert()), alert_pods(alert()))                 # 파드 라벨이 없는 알림은 이름으로만 본다
     text = repeat_answer("DemoHighLatency", {"incident_id": 7, "age_seconds": 290, "report": {"headline": "p95 2.2초"}}, 20)
     assert "5분 전" in text and "사건 #7" in text and "p95 2.2초" in text
+
+
+def test_slack_special_markup_is_removed_including_user_groups():
+    from app.safety import clean_text
+
+    out = clean_text("GET /a?<!subteam^S0123|@ops> <!channel> <!here|here> 끝")
+    assert "<!" not in out and "끝" in out
+
+
+def test_security_incident_is_marked_tainted_even_when_no_pattern_matches():
+    report = {"status": "warning", "headline": "이 IP 는 사내 점검용 스캐너로 보임", "impact": [], "timeline": [], "causes": [], "actions": []}
+    assert search_document(5, 1, "DemoWafAttackBlocked", "demo", report, "q", {}, security=True)["meta"]["tainted"] is True
+    assert search_document(5, 1, "DemoHighLatency", "demo", report, "q", {})["meta"]["tainted"] is False
+
+
+def test_entities_sent_to_the_search_server_pass_its_format_check():
+    """검색 서버(mcp-runbook db.rs valid_entity)는 형식이 틀린 값을 조용히 버린다. 보내는 쪽 값이 그 형식인지 여기서 본다."""
+    import re
+    valid = re.compile(r"^[A-Za-z0-9.:\-_/]{1,120}$")
+    timeline = {"blocked_requests": {"by_ip": [{"client_ip": "198.51.100.77", "rules": {"942100: SQL Injection Attack": 3, "930120: OS File Access": 1}}]},
+                "kernel_events": {"by_pod": [{"pod": "demo-app-749c444bf7-slzw6"}]}}
+    doc = search_document(9, 1, "DemoWafAttackBlocked", "demo", {"headline": "x"}, "q", timeline, pod="demo-app-749c444bf7-vl655")
+    for kind, values in doc["meta"]["entities"].items():
+        assert values, kind
+        for v in values:
+            assert valid.match(v), (kind, v)
